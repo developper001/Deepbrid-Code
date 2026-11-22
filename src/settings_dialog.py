@@ -6,19 +6,17 @@ from tkinter import filedialog, ttk
 from typing import Callable, Protocol
 
 from .settings import (
-    API_KEY,
-    AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
     REMOVE_IMAGES_AFTER_SEND,
+    SecretStorageError,
     WRAP_TEXT,
 )
 
 
 class SettingsBackend(Protocol):
     def set_bool(self, name: str, value: bool) -> None: ...
-    def get(self, name: str) -> str | None: ...
-    def set(self, name: str, value: str) -> None: ...
+    def set_secret(self, name: str, value: str) -> None: ...
 
 
 class SettingsDialog:
@@ -26,8 +24,6 @@ class SettingsDialog:
         self,
         parent: tk.Tk,
         settings: SettingsBackend,
-        auto_open_chrome: bool,
-        on_auto_open_changed: Callable[[bool], None],
         dark_theme: bool,
         on_dark_theme_changed: Callable[[bool], None],
         wrap_text: bool,
@@ -40,17 +36,14 @@ class SettingsDialog:
         on_output_logging_changed: Callable[[str], None],
         api_key: str = "",
         on_api_key_changed: Callable[[str], None] | None = None,
-        on_get_api_key: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
-        self.on_auto_open_changed = on_auto_open_changed
         self.on_dark_theme_changed = on_dark_theme_changed
         self.on_wrap_text_changed = on_wrap_text_changed
         self.on_remove_images_after_send_changed = on_remove_images_after_send_changed
         self.on_diagnostics_enabled_changed = on_diagnostics_enabled_changed
         self.on_output_logging_changed = on_output_logging_changed
         self.on_api_key_changed = on_api_key_changed
-        self.on_get_api_key = on_get_api_key
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
         self.dialog.geometry("640x560")
@@ -67,7 +60,7 @@ class SettingsDialog:
         ttk.Label(navigation, text="Sections").pack(anchor="w", pady=(0, 8))
         ttk.Label(
             navigation,
-            text="Startup",
+            text="Deepbrid API",
             relief="solid",
             padding=(10, 6),
         ).pack(fill="x")
@@ -87,33 +80,68 @@ class SettingsDialog:
         content = ttk.Frame(frame, padding=12, relief="groove")
         content.grid(row=0, column=1, sticky="nsew")
         content.columnconfigure(0, weight=1)
-        ttk.Label(content, text="Startup", font=("TkDefaultFont", 14, "bold")).grid(
+        ttk.Label(content, text="Deepbrid AI API", font=("TkDefaultFont", 14, "bold")).grid(
             row=0,
             column=0,
             sticky="w",
-            pady=(0, 12),
+            pady=(0, 8),
         )
         self.status = tk.StringVar(master=self.dialog)
-        self.enabled = tk.BooleanVar(master=self.dialog, value=auto_open_chrome)
-        ttk.Checkbutton(
-            content,
-            text="Open Deepbrid AI Chat in Chrome when Deepbrid Code starts",
-            variable=self.enabled,
-            command=self._save,
-        ).grid(row=1, column=0, sticky="w")
         ttk.Label(
             content,
             text=(
-                "Uses the app's separate Chrome profile. If you have not signed in, "
-                "Deepbrid will show its login page. You can still open the chat manually "
-                "from the app."
+                "A Premium API key is required. Requests use Deepbrid's official API; "
+                "the key is stored in your operating-system credential store."
             ),
             wraplength=420,
             justify="left",
-        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Separator(content).grid(row=3, column=0, sticky="ew", pady=(16, 12))
-        ttk.Label(content, text="Appearance", font=("TkDefaultFont", 12, "bold")).grid(
+        ).grid(row=1, column=0, sticky="w")
+        self.api_key = tk.StringVar(master=self.dialog, value=api_key)
+        api_key_controls = ttk.Frame(content)
+        api_key_controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        api_key_controls.columnconfigure(0, weight=1)
+        self.api_key_entry = ttk.Entry(
+            api_key_controls,
+            textvariable=self.api_key,
+            show="*",
+        )
+        self.api_key_entry.grid(row=0, column=0, sticky="ew")
+
+        def toggle_api_key_visibility() -> None:
+            visible = self.api_key_entry.cget("show") == "*"
+            self.api_key_entry.configure(show="" if visible else "*")
+            api_key_visibility.configure(text="Hide" if visible else "Show")
+
+        api_key_visibility = ttk.Button(
+            api_key_controls,
+            text="Show",
+            command=toggle_api_key_visibility,
+        )
+        api_key_visibility.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            api_key_controls,
+            text="Save",
+            command=self._save_api_key,
+        ).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(
+            content,
+            text="Get a key at https://www.deepbrid.com/devices",
+            wraplength=420,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.api_key_status = tk.StringVar(
+            master=self.dialog,
+            value="API ready." if api_key else "Add your API key to use Deepbrid AI.",
+        )
+        ttk.Label(content, textvariable=self.api_key_status).grid(
             row=4,
+            column=0,
+            sticky="w",
+            pady=(4, 0),
+        )
+        ttk.Separator(content).grid(row=5, column=0, sticky="ew", pady=(14, 10))
+        ttk.Label(content, text="Appearance", font=("TkDefaultFont", 12, "bold")).grid(
+            row=6,
             column=0,
             sticky="w",
             pady=(0, 8),
@@ -125,13 +153,13 @@ class SettingsDialog:
             text="Use dark mode",
             variable=self.dark_theme,
             command=self._save_dark_theme,
-        ).grid(row=5, column=0, sticky="w")
+        ).grid(row=7, column=0, sticky="w")
         ttk.Checkbutton(
             content,
             text="Wrap text in file preview",
             variable=self.wrap_text,
             command=self._save_wrap_text,
-        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=8, column=0, sticky="w", pady=(6, 0))
         self.remove_images_after_send = tk.BooleanVar(
             master=self.dialog,
             value=remove_images_after_send,
@@ -141,10 +169,10 @@ class SettingsDialog:
             text="Remove images from context after sending",
             variable=self.remove_images_after_send,
             command=self._save_remove_images_after_send,
-        ).grid(row=7, column=0, sticky="w", pady=(6, 0))
-        ttk.Separator(content).grid(row=8, column=0, sticky="ew", pady=(14, 10))
+        ).grid(row=9, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(content).grid(row=10, column=0, sticky="ew", pady=(14, 10))
         ttk.Label(content, text="Diagnostics", font=("TkDefaultFont", 12, "bold")).grid(
-            row=9,
+            row=11,
             column=0,
             sticky="w",
             pady=(0, 6),
@@ -170,15 +198,15 @@ class SettingsDialog:
             text="Enable diagnostics file logging",
             variable=self.diagnostics_enabled,
             command=self._save_diagnostics_enabled,
-        ).grid(row=10, column=0, sticky="w")
+        ).grid(row=12, column=0, sticky="w")
         ttk.Label(content, text="Diagnostics file path (kept when logging is disabled)").grid(
-            row=11,
+            row=13,
             column=0,
             sticky="w",
             pady=(6, 0),
         )
         log_path_controls = ttk.Frame(content)
-        log_path_controls.grid(row=12, column=0, sticky="ew", pady=(6, 0))
+        log_path_controls.grid(row=14, column=0, sticky="ew", pady=(6, 0))
         log_path_controls.columnconfigure(0, weight=1)
         ttk.Entry(
             log_path_controls,
@@ -204,68 +232,13 @@ class SettingsDialog:
             textvariable=self.output_log_status,
         )
         self.output_log_status_label.grid(
-            row=13,
-            column=0,
-            sticky="w",
-            pady=(4, 0),
-        )
-        ttk.Separator(content).grid(row=14, column=0, sticky="ew", pady=(14, 10))
-        ttk.Label(content, text="Deepbrid AI API", font=("TkDefaultFont", 12, "bold")).grid(
             row=15,
-            column=0,
-            sticky="w",
-            pady=(0, 6),
-        )
-        ttk.Label(
-            content,
-            text="API key for direct, official AI requests (Premium required).",
-            wraplength=420,
-            justify="left",
-        ).grid(row=16, column=0, sticky="w")
-        api_key_controls = ttk.Frame(content)
-        api_key_controls.grid(row=17, column=0, sticky="ew", pady=(6, 0))
-        api_key_controls.columnconfigure(0, weight=1)
-        self.api_key = tk.StringVar(master=self.dialog, value=api_key)
-        self.api_key_entry = ttk.Entry(
-            api_key_controls,
-            textvariable=self.api_key,
-            show="*",
-        )
-        self.api_key_entry.grid(row=0, column=0, sticky="ew")
-
-        def toggle_api_key_visibility() -> None:
-            visible = self.api_key_entry.cget("show") == "*"
-            self.api_key_entry.configure(show="" if visible else "*")
-            api_key_visibility.configure(text="Hide" if visible else "Show")
-
-        api_key_visibility = ttk.Button(
-            api_key_controls,
-            text="Show",
-            command=toggle_api_key_visibility,
-        )
-        api_key_visibility.grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(
-            api_key_controls,
-            text="Get API key",
-            command=self.on_get_api_key or (lambda: None),
-        ).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(
-            api_key_controls,
-            text="Save",
-            command=self._save_api_key,
-        ).grid(row=0, column=3, padx=(8, 0))
-        self.api_key_status = tk.StringVar(
-            master=self.dialog,
-            value="Direct API is used when an API key is saved." if api_key else "Chrome fallback is active.",
-        )
-        ttk.Label(content, textvariable=self.api_key_status).grid(
-            row=18,
             column=0,
             sticky="w",
             pady=(4, 0),
         )
         ttk.Label(content, textvariable=self.status).grid(
-            row=19,
+            row=16,
             column=0,
             sticky="w",
             pady=(8, 0),
@@ -277,25 +250,12 @@ class SettingsDialog:
             pady=(12, 0),
         )
         self.dialog.grab_set()
-        self.saved_enabled = auto_open_chrome
         self.saved_dark_theme = dark_theme
         self.saved_wrap_text = wrap_text
         self.saved_remove_images_after_send = remove_images_after_send
         self.saved_diagnostics_enabled = diagnostics_enabled
         self.saved_output_log_path = output_log_path
         self.saved_api_key = api_key
-
-    def _save(self) -> None:
-        enabled = self.enabled.get()
-        try:
-            self.settings.set_bool(AUTO_OPEN_CHROME, enabled)
-        except (OSError, sqlite3.Error) as error:
-            self.enabled.set(self.saved_enabled)
-            self.status.set(f"Could not save setting: {error}")
-            return
-        self.saved_enabled = enabled
-        self.on_auto_open_changed(enabled)
-        self.status.set("Saved.")
 
     def _save_dark_theme(self) -> None:
         enabled = self.dark_theme.get()
@@ -407,11 +367,11 @@ class SettingsDialog:
             return
         try:
             self.on_api_key_changed(key)
-        except (OSError, ValueError, sqlite3.Error) as error:
+        except (OSError, ValueError, sqlite3.Error, SecretStorageError) as error:
             self.api_key.set(self.saved_api_key)
             self.api_key_status.set(f"Could not save API key: {error}")
             return
         self.saved_api_key = key
         self.api_key_status.set(
-            "Direct API is active." if key else "Chrome fallback is active."
+            "API key saved." if key else "API key removed."
         )

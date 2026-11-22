@@ -7,7 +7,6 @@ import tempfile
 import threading
 import tkinter as tk
 import traceback
-import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -16,8 +15,14 @@ from types import TracebackType
 
 from PIL import Image, ImageGrab, ImageTk
 
-from .ai_api import DeepbridApiClient, DeepbridApiError
-from .browser import BrowserLaunchError, ChatSession, DeepbridChatBrowser
+from .ai_api import (
+    AiAssistant,
+    AiConversation,
+    AiMessage,
+    AiModel,
+    DeepbridApiClient,
+    DeepbridApiError,
+)
 from .context import (
     ContextFile,
     build_prompt,
@@ -31,7 +36,6 @@ from .context import (
 from .logo import create_brand_icon
 from .settings import (
     API_KEY,
-    AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
     LAST_PROJECT,
@@ -50,21 +54,12 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_LOG_PATH = APP_ROOT / "diagnostics" / "deepbrid-code.log"
 MAX_IMAGE_PREVIEW_BYTES = 20 * 1024 * 1024
 APP_ICON_PATH = Path(__file__).parent / "assets" / "deepbrid-code.ico"
-AI_MODELS = (
-    "GPT-6.1 Sol · Best",
-    "GPT-6 Luna · Fast",
-    "Grok 4.7",
-    "Gemini 3.8 Flash · Fast",
-    "Gemini 4 Argon",
-)
-AI_MODES = (
-    "Code Assistant",
-    "Document Analyst",
-    "Writing Partner",
-    "Patient Tutor",
-    "Summarizer",
-    "Brainstormer",
-    "Email Helper",
+FALLBACK_MODELS = (
+    AiModel("gpt-6.1-sol", "GPT-6.1 Sol · Best"),
+    AiModel("gpt-6-luna", "GPT-6 Luna · Fast"),
+    AiModel("grok-4.7", "Grok 4.7"),
+    AiModel("gemini-3.8-flash", "Gemini 3.8 Flash · Fast"),
+    AiModel("gemini-4-argon", "Gemini 4 Argon"),
 )
 
 
@@ -75,7 +70,6 @@ class DeepbridCodeApp:
         self.root.geometry("1180x760")
         self.root.minsize(900, 600)
         self.settings = SettingsStore(SETTINGS_DATABASE)
-        self.auto_open_chrome = self.settings.get_bool(AUTO_OPEN_CHROME, default=True)
         self.dark_theme = self.settings.get_bool(DARK_THEME, default=False)
         self.wrap_text = self.settings.get_bool(WRAP_TEXT, default=True)
         self.remove_images_after_send = self.settings.get_bool(
@@ -96,8 +90,11 @@ class DeepbridCodeApp:
             self.diagnostics_enabled and bool(self.output_log_path.strip())
         )
         self.last_project = self.settings.get(LAST_PROJECT)
-        self.api_key = self.settings.get(API_KEY) or ""
-        self.api_conversation_id: int | None = None
+        self.api_key = self.settings.get_secret(API_KEY) or ""
+        self.api_key_generation = 0
+        self.api_conversation_id: str | None = None
+        self.api_models = list(FALLBACK_MODELS)
+        self.api_assistants: list[AiAssistant] = []
         self.project_root: Path | None = None
         self.tree_paths: dict[str, Path] = {}
         self.tree_directories: dict[str, Path] = {}
@@ -115,18 +112,18 @@ class DeepbridCodeApp:
         self.cleanup_clipboard_after_chat = False
         self.pending_image_context_keys: list[str] = []
         self.pending_remove_images_after_send = True
-        self.chat_browser = DeepbridChatBrowser(APP_DATA_DIR / "chrome-profile")
         self.chat_events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.sessions_events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.api_options_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.sessions_window: tk.Toplevel | None = None
         self.sessions_tree: ttk.Treeview | None = None
         self.sessions_status: tk.StringVar | None = None
         self.sessions_filter = tk.StringVar(master=self.root)
-        self.sessions: list[ChatSession] = []
-        self.session_rows: dict[str, ChatSession] = {}
+        self.sessions: list[AiConversation] = []
+        self.session_rows: dict[str, AiConversation] = {}
         self.sessions_request_active = False
-        self.ai_model = AI_MODELS[0]
-        self.ai_mode = AI_MODES[0]
+        self.ai_model = FALLBACK_MODELS[0].label
+        self.ai_assistant = ""
         self.web_enabled = False
         self.console_events: queue.Queue[str] = queue.Queue()
         self.console_history: deque[str] = deque(maxlen=2000)
@@ -139,7 +136,6 @@ class DeepbridCodeApp:
         self._startup_after_id: str | None = None
         self._initial_sash_set = False
         self.chat_request_active = False
-        self.browser_request_active = False
 
         self._build_ui()
         self._apply_theme()
@@ -165,28 +161,29 @@ class DeepbridCodeApp:
         self.logo_label = ttk.Label(toolbar, image=self.logo_image)
         self.logo_label.pack(side="left", padx=(0, 8))
         ttk.Button(toolbar, text="Open folder...", command=self._open_folder).pack(side="left")
-        ttk.Button(toolbar, text="Open Deepbrid AI Chat", command=self._open_browser).pack(
-            side="left", padx=(8, 0)
-        )
         ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(
             side="left",
             padx=(8, 0),
         )
-        self.sessions_button = ttk.Button(toolbar, text="Sessions", command=self._open_sessions)
+        self.sessions_button = ttk.Button(
+            toolbar,
+            text="Conversations",
+            command=self._open_sessions,
+        )
         self.sessions_button.pack(
             side="left",
             padx=(8, 0),
         )
-        ttk.Label(toolbar, text="Mode").pack(side="left", padx=(16, 4))
-        self.mode_selector = ttk.Combobox(
+        ttk.Label(toolbar, text="Assistant").pack(side="left", padx=(16, 4))
+        self.assistant_selector = ttk.Combobox(
             toolbar,
             state="readonly",
-            values=AI_MODES,
+            values=("Default",),
             width=20,
         )
-        self.mode_selector.set(self.ai_mode)
-        self.mode_selector.pack(side="left")
-        self.mode_selector.bind("<<ComboboxSelected>>", self._mode_changed)
+        self.assistant_selector.set("Default")
+        self.assistant_selector.pack(side="left")
+        self.assistant_selector.bind("<<ComboboxSelected>>", self._assistant_changed)
 
         self.workspace = ttk.Panedwindow(self.root, orient="vertical")
         self.workspace.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -279,7 +276,7 @@ class DeepbridCodeApp:
         self.preview_image_label = ttk.Label(files_panel)
         self.preview_image_label.grid(row=5, column=0, sticky="ew")
 
-        ttk.Label(chat_panel, text="Conversation (kept in memory only)").pack(anchor="w")
+        ttk.Label(chat_panel, text="Conversation (saved to your Deepbrid account)").pack(anchor="w")
         self.chat_output = tk.Text(chat_panel, height=20, wrap="word", state="disabled")
         self.chat_output.pack(fill="both", expand=True, pady=(4, 8))
 
@@ -308,7 +305,7 @@ class DeepbridCodeApp:
         self.model_selector = ttk.Combobox(
             actions,
             state="readonly",
-            values=AI_MODELS,
+            values=tuple(model.label for model in FALLBACK_MODELS),
             width=22,
         )
         self.model_selector.set(self.ai_model)
@@ -330,7 +327,7 @@ class DeepbridCodeApp:
         )
 
         self.status = tk.StringVar(
-            value="Selected context stays local until sent to Deepbrid AI Chat."
+            value="Selected context stays local until sent to Deepbrid AI."
         )
         ttk.Label(self.root, textvariable=self.status, relief="sunken", anchor="w", padding=5).pack(
             fill="x", side="bottom"
@@ -485,16 +482,14 @@ class DeepbridCodeApp:
                 self.status.set(
                     f"The previously opened project is unavailable: {project}"
                 )
-        if self.auto_open_chrome:
-            self._start_browser_open(startup=True)
+        if self.api_key:
+            self._load_api_options()
 
     def _open_settings(self) -> None:
         try:
             SettingsDialog(
                 self.root,
                 self.settings,
-                self.auto_open_chrome,
-                self._set_auto_open_chrome,
                 self.dark_theme,
                 self._set_dark_theme,
                 self.wrap_text,
@@ -507,13 +502,9 @@ class DeepbridCodeApp:
                 self._set_output_logging,
                 self.api_key,
                 self._set_api_key,
-                lambda: webbrowser.open("https://www.deepbrid.com/devices"),
             )
         except (OSError, sqlite3.Error) as error:
             self.status.set(f"Could not open Settings: {error}")
-
-    def _set_auto_open_chrome(self, enabled: bool) -> None:
-        self.auto_open_chrome = enabled
 
     def _set_dark_theme(self, enabled: bool) -> None:
         self.dark_theme = enabled
@@ -525,22 +516,136 @@ class DeepbridCodeApp:
 
     def _set_api_key(self, key: str) -> None:
         normalized = key.strip()
-        self.settings.set(API_KEY, normalized)
+        self.settings.set_secret(API_KEY, normalized)
         self.api_key = normalized
+        self.api_key_generation += 1
         self.api_conversation_id = None
+        if normalized:
+            self._load_api_options()
+            self.status.set("Saved API key. Loading available models and assistants...")
+        else:
+            self.api_models = []
+            self.api_assistants = []
+            self.model_selector.configure(values=())
+            self.assistant_selector.configure(values=("Default",))
+            self.model_selector.set("")
+            self.assistant_selector.set("Default")
+            self.status.set("API key removed. Add a Premium API key in Settings to chat.")
         self._log("Deepbrid AI API key updated." if normalized else "Deepbrid AI API key cleared.")
 
     def _set_remove_images_after_send(self, enabled: bool) -> None:
         self.remove_images_after_send = enabled
 
-    def _mode_changed(self, _event: tk.Event) -> None:
-        self.ai_mode = self.mode_selector.get()
+    def _assistant_changed(self, _event: tk.Event) -> None:
+        selected = self.assistant_selector.get()
+        self.ai_assistant = next(
+            (
+                assistant.assistant_id
+                for assistant in self.api_assistants
+                if assistant.label == selected
+            ),
+            "",
+        )
 
     def _model_changed(self, _event: tk.Event) -> None:
         self.ai_model = self.model_selector.get()
 
+    def _selected_model_id(self) -> str | None:
+        return next(
+            (model.model_id for model in self.api_models if model.label == self.ai_model),
+            None,
+        )
+
     def _web_changed(self) -> None:
         self.web_enabled = self.web_var.get()
+
+    def _load_api_options(self) -> None:
+        if not self.api_key:
+            return
+        api_key = self.api_key
+        generation = self.api_key_generation
+        worker = threading.Thread(
+            target=self._api_options_worker,
+            args=(api_key, generation),
+            name="deepbrid-api-options",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self.status.set(f"Could not start API configuration request: {error}")
+
+    def _api_options_worker(self, api_key: str, generation: int) -> None:
+        try:
+            client = DeepbridApiClient(api_key)
+            models = client.list_models()
+            assistants = client.list_assistants()
+            self.api_options_events.put(("success", (generation, models, assistants)))
+        except (DeepbridApiError, OSError, RuntimeError) as error:
+            self.api_options_events.put(("error", (generation, str(error))))
+
+    def _poll_api_options_events(self) -> None:
+        while True:
+            try:
+                event, payload = self.api_options_events.get_nowait()
+            except queue.Empty:
+                return
+            if event == "error":
+                if (
+                    isinstance(payload, tuple)
+                    and len(payload) == 2
+                    and payload[0] == self.api_key_generation
+                ):
+                    self.status.set(str(payload[1]))
+                continue
+            if (
+                event != "success"
+                or not isinstance(payload, tuple)
+                or len(payload) != 3
+                or payload[0] != self.api_key_generation
+                or not isinstance(payload[1], list)
+                or not isinstance(payload[2], list)
+                or not all(isinstance(item, AiModel) for item in payload[1])
+                or not all(isinstance(item, AiAssistant) for item in payload[2])
+            ):
+                if (
+                    isinstance(payload, tuple)
+                    and payload
+                    and payload[0] != self.api_key_generation
+                ):
+                    continue
+                self.status.set("Deepbrid returned invalid model or assistant data.")
+                continue
+            self.api_models, self.api_assistants = payload[1], payload[2]
+            model_labels = [model.label for model in self.api_models]
+            if self.ai_model not in model_labels:
+                self.ai_model = model_labels[0]
+            self.model_selector.configure(values=model_labels)
+            self.model_selector.set(self.ai_model)
+
+            assistant_labels = [
+                "Default",
+                *(assistant.label for assistant in self.api_assistants),
+            ]
+            selected_assistant = next(
+                (
+                    assistant
+                    for assistant in self.api_assistants
+                    if assistant.assistant_id == self.ai_assistant
+                ),
+                None,
+            )
+            self.assistant_selector.configure(values=assistant_labels)
+            self.assistant_selector.set(
+                selected_assistant.label if selected_assistant else "Default"
+            )
+            self.ai_assistant = (
+                selected_assistant.assistant_id if selected_assistant else ""
+            )
+            self.status.set(
+                f"Loaded {len(self.api_models)} model(s) and "
+                f"{len(self.api_assistants)} assistant(s) from Deepbrid."
+            )
 
     def _set_diagnostics_enabled(self, enabled: bool) -> None:
         normalized_path = self.output_log_path.strip()
@@ -580,7 +685,7 @@ class DeepbridCodeApp:
             except tk.TclError:
                 pass
         dialog = tk.Toplevel(self.root)
-        dialog.title("Sessions")
+        dialog.title("Conversations")
         dialog.geometry("560x460")
         dialog.minsize(460, 340)
         dialog.transient(self.root)
@@ -590,7 +695,7 @@ class DeepbridCodeApp:
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(2, weight=1)
-        ttk.Label(frame, text="Search sessions").grid(
+        ttk.Label(frame, text="Search conversations").grid(
             row=0,
             column=0,
             sticky="w",
@@ -603,7 +708,7 @@ class DeepbridCodeApp:
             show="headings",
             selectmode="browse",
         )
-        tree.heading("title", text="Session")
+        tree.heading("title", text="Conversation")
         tree.heading("updated", text="Updated")
         tree.column("title", width=360, anchor="w")
         tree.column("updated", width=140, anchor="w")
@@ -628,6 +733,11 @@ class DeepbridCodeApp:
             text="Refresh",
             command=self._refresh_sessions,
         ).pack(side="left")
+        ttk.Button(
+            actions,
+            text="Search Deepbrid",
+            command=self._search_sessions,
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(
             actions,
             text="New chat",
@@ -678,17 +788,24 @@ class DeepbridCodeApp:
                 "end",
                 iid=row,
                 values=(session.title, session.updated),
-                tags=("active",) if session.active else (),
+                tags=("pinned",) if session.pinned else (),
             )
             self.session_rows[row] = session
-        tree.tag_configure("active", font=("TkDefaultFont", 9, "bold"))
+        tree.tag_configure("pinned", font=("TkDefaultFont", 9, "bold"))
 
     def _refresh_sessions(self) -> None:
         if self.sessions_request_active:
             if self.sessions_status is not None:
-                self.sessions_status.set("Session request already in progress...")
+                self.sessions_status.set("Conversation request already in progress...")
             return
         self._start_sessions_request("list")
+
+    def _search_sessions(self) -> None:
+        query = self.sessions_filter.get().strip()
+        if not query:
+            self._refresh_sessions()
+            return
+        self._start_sessions_request("search", query)
 
     def _start_new_chat(self) -> None:
         self._start_sessions_request("new")
@@ -704,19 +821,27 @@ class DeepbridCodeApp:
             return
         session = self.session_rows.get(selection[0])
         if session is not None:
-            self._start_sessions_request("open", session.session_id)
+            self._start_sessions_request("open", session.conversation_id)
 
-    def _start_sessions_request(self, action: str, session_id: str | None = None) -> None:
+    def _start_sessions_request(self, action: str, value: str | None = None) -> None:
+        if not self.api_key:
+            message = "Add your Deepbrid Premium API key in Settings to use conversations."
+            if self.sessions_status is not None:
+                self.sessions_status.set(message)
+            self.status.set(message)
+            return
         if self.sessions_request_active:
             return
         self.sessions_request_active = True
         if self.sessions_status is not None:
             self.sessions_status.set(
-                "Loading sessions..." if action == "list" else "Opening chat..."
+                "Loading conversations..."
+                if action in {"list", "search"}
+                else "Opening chat..."
             )
         worker = threading.Thread(
             target=self._sessions_worker,
-            args=(action, session_id),
+            args=(action, value),
             name="deepbrid-sessions",
             daemon=True,
         )
@@ -727,20 +852,38 @@ class DeepbridCodeApp:
             if self.sessions_status is not None:
                 self.sessions_status.set(f"Could not start the session request: {error}")
 
-    def _sessions_worker(self, action: str, session_id: str | None) -> None:
+    def _sessions_worker(self, action: str, value: str | None) -> None:
         try:
+            client = DeepbridApiClient(self.api_key)
             if action == "list":
-                sessions = self.chat_browser.list_sessions()
+                sessions = client.list_conversations()
                 self.sessions_events.put(("sessions-list-success", sessions))
-            elif action == "open" and session_id is not None:
-                self.chat_browser.open_session(session_id)
-                self.sessions_events.put(("sessions-action-success", "Opened session."))
+            elif action == "search" and value is not None:
+                sessions = client.list_conversations(value)
+                self.sessions_events.put(("sessions-list-success", sessions))
+            elif action == "open" and value is not None:
+                messages = client.get_messages(value)
+                self.sessions_events.put(
+                    (
+                        "sessions-action-success",
+                        {"action": action, "conversation_id": value, "messages": messages},
+                    )
+                )
             elif action == "new":
-                self.chat_browser.new_chat()
-                self.sessions_events.put(("sessions-action-success", "Started a new chat."))
+                conversation_id = client.create_conversation(
+                    model=self._selected_model_id(),
+                    assistant=self.ai_assistant or None,
+                    use_web=self.web_enabled,
+                )
+                self.sessions_events.put(
+                    (
+                        "sessions-action-success",
+                        {"action": action, "conversation_id": conversation_id, "messages": []},
+                    )
+                )
             else:
-                raise ValueError(f"Unknown session action: {action}")
-        except (BrowserLaunchError, OSError, RuntimeError, ValueError) as error:
+                raise ValueError(f"Unknown conversation action: {action}")
+        except (DeepbridApiError, OSError, RuntimeError, ValueError) as error:
             self.sessions_events.put(("sessions-error", str(error)))
 
     def _poll_sessions_events(self) -> None:
@@ -752,18 +895,39 @@ class DeepbridCodeApp:
             self.sessions_request_active = False
             if event == "sessions-list-success":
                 if not isinstance(content, list) or not all(
-                    isinstance(session, ChatSession) for session in content
+                    isinstance(session, AiConversation) for session in content
                 ):
                     if self.sessions_status is not None:
-                        self.sessions_status.set("Deepbrid returned invalid session data.")
+                        self.sessions_status.set("Deepbrid returned invalid conversation data.")
                     continue
                 self.sessions = content
                 self._filter_sessions()
                 if self.sessions_status is not None:
-                    self.sessions_status.set(f"{len(content)} session(s) loaded.")
+                    self.sessions_status.set(f"{len(content)} conversation(s) loaded.")
             elif event == "sessions-action-success":
-                if isinstance(content, str):
-                    self.status.set(content)
+                if isinstance(content, dict):
+                    conversation_id = content.get("conversation_id")
+                    messages = content.get("messages")
+                    if not isinstance(conversation_id, str) or not isinstance(messages, list):
+                        self.status.set("Deepbrid returned invalid conversation data.")
+                        continue
+                    if not all(isinstance(message, AiMessage) for message in messages):
+                        self.status.set("Deepbrid returned invalid message data.")
+                        continue
+                    self.api_conversation_id = conversation_id
+                    self.chat_output.configure(state="normal")
+                    self.chat_output.delete("1.0", "end")
+                    self.chat_output.configure(state="disabled")
+                    for message in messages:
+                        self._append_chat(
+                            "You" if message.role == "user" else "Deepbrid AI",
+                            message.content,
+                        )
+                    self.status.set(
+                        "Started a new conversation."
+                        if content.get("action") == "new"
+                        else "Opened conversation."
+                    )
                 self._close_sessions()
             elif event == "sessions-error":
                 message = str(content)
@@ -1478,8 +1642,8 @@ class DeepbridCodeApp:
         if self.chat_request_active:
             self.status.set("Wait for the current Deepbrid AI Chat response to finish.")
             return
-        if self.browser_request_active:
-            self.status.set("Wait for the dedicated Chrome profile to finish opening.")
+        if not self.api_key:
+            self.status.set("Add your Deepbrid Premium API key in Settings before sending.")
             return
         try:
             prompt = build_prompt(
@@ -1499,28 +1663,25 @@ class DeepbridCodeApp:
             for item in self.context_files.values()
             if item.kind in {"image", "file"}
         ]
-        external_attachment_paths = [
-            item.path
-            for item in self.context_files.values()
-            if item.kind in {"image", "file"} and item.external
-        ]
         self.pending_image_context_keys = [
             key
             for key, item in self.context_files.items()
             if item.kind == "image"
         ]
         self.pending_remove_images_after_send = self.remove_images_after_send
-        selected_model = self.model_selector.get()
-        selected_mode = self.mode_selector.get()
+        selected_model = self._selected_model_id()
+        if selected_model is None:
+            self.status.set("No Deepbrid AI model is selected. Check your API key in Settings.")
+            return
+        selected_assistant = self.ai_assistant or None
         web_enabled = self.web_var.get()
-        self.ai_model = selected_model
-        self.ai_mode = selected_mode
+        self.ai_model = self.model_selector.get()
         self.web_enabled = web_enabled
         self.chat_request_active = True
         self._log(
             f"Sending prompt with {len(self.context_files)} context item(s) "
             f"and {len(attachment_paths)} attachment(s), model {selected_model}, "
-            f"mode {selected_mode}, Web {'on' if web_enabled else 'off'}."
+            f"assistant {selected_assistant or 'default'}, Web {'on' if web_enabled else 'off'}."
         )
         self._append_chat("You", prompt)
         if attachment_paths:
@@ -1536,10 +1697,8 @@ class DeepbridCodeApp:
             args=(
                 prompt,
                 attachment_paths,
-                self.project_root,
-                external_attachment_paths,
                 selected_model,
-                selected_mode,
+                selected_assistant,
                 web_enabled,
             ),
             name="deepbrid-chat-ui",
@@ -1557,40 +1716,23 @@ class DeepbridCodeApp:
         self,
         prompt: str,
         attachment_paths: list[Path],
-        project_root: Path | None,
-        external_attachment_paths: list[Path],
         model: str,
-        mode: str,
+        assistant: str | None,
         web_enabled: bool,
     ) -> None:
         try:
-            if self.api_key:
-                client = DeepbridApiClient(self.api_key)
-                response, conversation_id = client.chat(
-                    prompt,
-                    model=model,
-                    use_web=web_enabled,
-                    conversation_id=self.api_conversation_id,
-                    attachment_paths=attachment_paths,
-                )
-                self.api_conversation_id = conversation_id
-                self.chat_events.put(("chat-submitted", ""))
-            else:
-                response = self.chat_browser.send_message(
-                    prompt,
-                    attachment_paths,
-                    project_root,
-                    external_attachment_paths,
-                    on_submitted=lambda: self.chat_events.put(("chat-submitted", "")),
-                    model=model,
-                    mode=mode,
-                    web_enabled=web_enabled,
-                )
+            response, conversation_id = DeepbridApiClient(self.api_key).chat(
+                prompt,
+                model=model,
+                use_web=web_enabled,
+                conversation_id=self.api_conversation_id,
+                assistant=assistant,
+                attachment_paths=attachment_paths,
+            )
+            self.api_conversation_id = conversation_id
+            self.chat_events.put(("chat-submitted", ""))
         except DeepbridApiError as error:
             self._log(f"Deepbrid AI API request failed: {error}")
-            self.chat_events.put(("chat-error", str(error)))
-        except BrowserLaunchError as error:
-            self._log(f"Chat request failed: {error}")
             self.chat_events.put(("chat-error", str(error)))
         except (OSError, ValueError, RuntimeError) as error:
             self._log(f"Chat operation failed: {error}")
@@ -1611,9 +1753,6 @@ class DeepbridCodeApp:
             if event in {"chat-success", "chat-error"}:
                 self.chat_request_active = False
                 self._stop_progress()
-            elif event.startswith("browser-"):
-                self.browser_request_active = False
-                self._stop_progress()
             if event == "chat-success":
                 self._log(f"Deepbrid AI Chat returned {len(content)} characters.")
                 self._append_chat("Deepbrid AI", content)
@@ -1625,16 +1764,9 @@ class DeepbridCodeApp:
                 if self.pending_remove_images_after_send:
                     self._remove_context_keys(self.pending_image_context_keys)
                 self.pending_image_context_keys = []
-            elif event == "browser-chat":
-                self._log("Deepbrid AI Chat is open and ready.")
-                self.status.set("Deepbrid AI Chat is open and ready.")
-            elif event == "browser-login":
-                self._log("Chrome is open to Deepbrid login.")
-                self.status.set("Chrome is open to Deepbrid login. Sign in, then send your message.")
-            elif event == "browser-error":
-                self.status.set(content)
         self._poll_console_events()
         self._poll_sessions_events()
+        self._poll_api_options_events()
         self._poll_after_id = self.root.after(200, self._poll_chat_events)
 
     def _on_root_destroy(self, event: tk.Event) -> None:
@@ -1663,41 +1795,6 @@ class DeepbridCodeApp:
         self.chat_output.insert("end", f"{speaker}:\n{content}\n\n")
         self.chat_output.see("end")
         self.chat_output.configure(state="disabled")
-
-    def _open_browser(self) -> None:
-        self._start_browser_open(startup=False)
-
-    def _start_browser_open(self, startup: bool) -> None:
-        if self.browser_request_active:
-            return
-        if self.chat_request_active:
-            self.status.set("Wait for the current Deepbrid AI Chat request to finish.")
-            return
-        self.browser_request_active = True
-        self.status.set(
-            "Opening Deepbrid AI Chat..." if not startup else "Opening Chrome on startup..."
-        )
-        self._start_progress()
-        worker = threading.Thread(
-            target=self._browser_worker,
-            name="deepbrid-chat-browser",
-            daemon=True,
-        )
-        try:
-            worker.start()
-        except RuntimeError as error:
-            self.browser_request_active = False
-            self._stop_progress()
-            self.status.set(f"Could not start Chrome: {error}")
-
-    def _browser_worker(self) -> None:
-        try:
-            landing_page = self.chat_browser.open_for_chat()
-        except (BrowserLaunchError, OSError, RuntimeError) as error:
-            self._log(f"Could not open Deepbrid AI Chat: {error}")
-            self.chat_events.put(("browser-error", f"Could not open Deepbrid AI Chat: {error}"))
-        else:
-            self.chat_events.put((f"browser-{landing_page}", ""))
 
     def _close(self) -> None:
         self._log("Deepbrid Code is closing.")

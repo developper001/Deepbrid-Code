@@ -10,11 +10,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from src.ai_api import AiConversation
 from src.app import DeepbridCodeApp
-from src.browser import ChatSession
 from src.context import build_prompt
 from src.settings import (
-    AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
     LAST_PROJECT,
@@ -28,16 +27,13 @@ from src.settings_dialog import SettingsDialog
 
 class AppStartupTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.browser_start_patcher = patch.object(
-            DeepbridCodeApp,
-            "_start_browser_open",
-        )
-        self.browser_start_patcher.start()
+        self.api_key_patcher = patch.object(SettingsStore, "get_secret", return_value=None)
+        self.api_key_patcher.start()
 
     def tearDown(self) -> None:
-        self.browser_start_patcher.stop()
+        self.api_key_patcher.stop()
 
-    def test_startup_reopens_saved_project_and_honors_disabled_chrome_setting(self) -> None:
+    def test_startup_reopens_saved_project_without_launching_a_browser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root_path = Path(temporary_directory)
             project = root_path / "project"
@@ -45,7 +41,6 @@ class AppStartupTests(unittest.TestCase):
             (project / "main.py").write_text("print('saved')", encoding="utf-8")
             store = SettingsStore(root_path / "settings.sqlite3")
             store.set(LAST_PROJECT, str(project))
-            store.set_bool(AUTO_OPEN_CHROME, False)
 
             root = tk.Tk()
             root.withdraw()
@@ -53,15 +48,13 @@ class AppStartupTests(unittest.TestCase):
                 with (
                     patch("src.app.SETTINGS_DATABASE", store.database_path),
                     patch("src.app.APP_DATA_DIR", root_path),
-                    patch.object(DeepbridCodeApp, "_start_browser_open") as open_browser,
                 ):
                     app = DeepbridCodeApp(root)
                     app._startup()
 
                 self.assertEqual(app.project_root, project.resolve())
                 self.assertEqual(len(app.tree_paths), 1)
-                self.assertFalse(app.auto_open_chrome)
-                open_browser.assert_not_called()
+                self.assertFalse(hasattr(app, "chat_browser"))
             finally:
                 root.destroy()
 
@@ -97,8 +90,7 @@ class AppStartupTests(unittest.TestCase):
                         action_buttons.index(app.model_selector),
                         action_buttons.index(app.send_button),
                     )
-                    self.assertEqual(app.ai_mode, "Code Assistant")
-                    self.assertEqual(app.mode_selector.get(), "Code Assistant")
+                    self.assertEqual(app.assistant_selector.get(), "Default")
                     self.assertFalse(app.web_enabled)
                     self.assertEqual(
                         app.output_log_path,
@@ -107,7 +99,7 @@ class AppStartupTests(unittest.TestCase):
                     self.assertFalse(app.diagnostics_enabled)
                     self.assertFalse(app.output_log_enabled)
                     self.assertFalse(hasattr(app, "project_label"))
-                    self.assertEqual(app.sessions_button.cget("text"), "Sessions")
+                    self.assertEqual(app.sessions_button.cget("text"), "Conversations")
                     self.assertEqual(app.send_button.cget("text"), "Send")
                     self.assertEqual(app.send_button.pack_info()["side"], "right")
                     with patch.object(app.main_pane, "winfo_height", return_value=600):
@@ -570,8 +562,6 @@ class AppStartupTests(unittest.TestCase):
                     dialog = SettingsDialog(
                         root,
                         app.settings,
-                        app.auto_open_chrome,
-                        app._set_auto_open_chrome,
                         app.dark_theme,
                         app._set_dark_theme,
                         app.wrap_text,
@@ -582,6 +572,8 @@ class AppStartupTests(unittest.TestCase):
                         app._set_diagnostics_enabled,
                         app.output_log_path,
                         app._set_output_logging,
+                        app.api_key,
+                        app._set_api_key,
                     )
                     dialog.dark_theme.set(True)
                     dialog._save_dark_theme()
@@ -675,15 +667,15 @@ class AppStartupTests(unittest.TestCase):
                         app._open_sessions()
                     request.assert_called_once_with("list")
                     app.sessions = [
-                        ChatSession("23", "Code review", "Today", True),
-                        ChatSession("24", "Research", "Yesterday", False),
+                        AiConversation("23", "Code review", "Today", "gpt-6.1-sol", True),
+                        AiConversation("24", "Research", "Yesterday", "gpt-6-luna"),
                     ]
                     app._filter_sessions()
                     self.assertEqual(len(app.session_rows), 2)
                     app.sessions_filter.set("research")
                     self.assertEqual(len(app.session_rows), 1)
                     row, session = next(iter(app.session_rows.items()))
-                    self.assertEqual(session.session_id, "24")
+                    self.assertEqual(session.conversation_id, "24")
                     app.sessions_tree.selection_set(row)
                     with patch.object(app, "_start_sessions_request") as open_request:
                         app._open_selected_session()
@@ -693,7 +685,7 @@ class AppStartupTests(unittest.TestCase):
             finally:
                 root.destroy()
 
-    def test_model_mode_web_defaults_and_send_state_are_wired(self) -> None:
+    def test_model_assistant_web_defaults_and_send_state_are_wired(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root_path = Path(temporary_directory)
             root = tk.Tk()
@@ -704,13 +696,17 @@ class AppStartupTests(unittest.TestCase):
                     patch("src.app.APP_DATA_DIR", root_path),
                 ):
                     app = DeepbridCodeApp(root)
+                    app.api_key = "test-api-key"
                     app.message.insert("1.0", "Review")
                     with patch("src.app.threading.Thread") as thread:
                         app._send()
                     args = thread.call_args.kwargs["args"]
-                    self.assertEqual(args[-3:], ("GPT-6.1 Sol · Best", "Code Assistant", False))
+                    self.assertEqual(
+                        args[-3:],
+                        ("gpt-6.1-sol", None, False),
+                    )
                     self.assertEqual(app.model_selector.get(), "GPT-6.1 Sol · Best")
-                    self.assertEqual(app.mode_selector.get(), "Code Assistant")
+                    self.assertEqual(app.assistant_selector.get(), "Default")
                     self.assertFalse(app.web_var.get())
             finally:
                 root.destroy()
@@ -791,7 +787,7 @@ class AppStartupTests(unittest.TestCase):
                     patch("src.app.APP_DATA_DIR", root_path),
                 ):
                     app = DeepbridCodeApp(root)
-                    app.auto_open_chrome = False
+                    app.api_key = "test-api-key"
                     app.message.insert("1.0", "What is 3 minus 1?")
                     with (
                         patch("src.app.threading.Thread") as thread,

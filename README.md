@@ -4,8 +4,6 @@ Deepbrid Code is a local-first Windows coding-assistant shell built with Python
 and Tkinter. It can open a project folder, preview text files and images, and
 prepare selected context for use in Deepbrid AI Chat.
 
-![Deepbrid Code showing the project explorer, file preview, and AI chat](src/img/screenshots/main-window.png)
-
 ## Run
 
 Requires Python 3.11 or newer with Tkinter available:
@@ -21,52 +19,25 @@ Run the tests with:
 python -m unittest discover -s tests -v
 ```
 
-## Current chat limitations
+## Deepbrid AI API
 
-For an official programmatic integration, add your Deepbrid API key in
-**Settings**. Deepbrid's documented `/api/v1/ai/chat` and `/api/v1/ai/upload`
-endpoints support Premium accounts, JSON/SSE chat responses, attachments,
-conversation continuity, Web search, and model selection. API requests use
-`Authorization: Bearer ...` and do not read browser cookies.
+Deepbrid Code uses Deepbrid's documented AI API directly; it does not launch or
+control a browser. A Premium account and API key are required. Add the key in
+**Settings** (obtain one at <https://www.deepbrid.com/devices>). The key is
+stored in the operating-system credential store. Requests use the documented
+Bearer authentication and are sent directly to Deepbrid.
 
-Without a configured API key, the app continues to control the dedicated Chrome
-profile through Chrome's loopback-only DevTools interface and interact with the
-visible AI Chat page. This fallback does not inspect network requests or depend
-on undocumented chat endpoints.
+Models and assistants are loaded from the API. Choose an assistant, model, and
+optional **Web** search before sending. Selected documents and images are
+uploaded through the official AI upload endpoint and attached to the message.
+Conversations are saved to the Deepbrid account; use **Conversations** to list,
+search, open, or start chats. Messages and conversation history are not stored
+in the local project.
 
-**Open Deepbrid AI Chat** launches Google Chrome with a separate profile under
-`%LOCALAPPDATA%\Deepbrid Code\chrome-profile`. Sign in yourself in that window.
-Chrome opens the AI Chat page when the profile is signed in; if not, Deepbrid's
-login page is opened. By default, the profile is started automatically when the
-app opens; change this in **Settings**.
-The app does not read, copy, or transmit browser cookies, passwords, or session
-tokens. The app can control that dedicated browser profile while it is running;
-the debugging port listens only on `127.0.0.1`. **Send** immediately submits the
-message and explicitly selected context through the visible chat UI. Supported
-documents and images are attached through the site's file-upload control. The
-app shows a busy indicator while waiting and displays either the rendered
-response or an error/timeout in the conversation and status bar.
-If Chrome is installed in a non-standard location, set
-`DEEPBRID_CHROME_PATH` to its executable before launching the app.
-The progress bar is shown only while Chrome is opening or a chat request is in
-progress.
-
-This UI integration is necessarily brittle: Deepbrid may change its chat page,
-which can require updating the visible-control selectors. If the page cannot
-be recognized or a response is not received, the app reports the failure and
-leaves the browser available for manual use. It does not inspect network
-requests or depend on undocumented chat APIs.
-
-The app stores preferences in `%LOCALAPPDATA%\Deepbrid Code\settings.sqlite3`,
-including the automatic Chrome setting, dark theme choice, and last opened
-project folder. Select a model, assistant mode, and optional **Web** search
-beside the message controls; the default mode is **Code Assistant** and Web
-search is off. These choices are applied through the visible Deepbrid controls
-when sending a message.
-
-Use **Sessions** to search the sessions currently available in Deepbrid, open a
-selected chat, or start a new one. Session history is read from the signed-in
-Deepbrid page and is not copied into local storage.
+If the key is missing or rejected, add or correct it in **Settings**. API
+features require Premium and remain subject to Deepbrid's daily and rate limits.
+See the [Deepbrid API documentation](https://www.deepbrid.com/api-docs) for
+current model, file, and usage limits.
 
 ## Privacy and project files
 
@@ -99,9 +70,9 @@ attached by the app.
    send the message and listed context. Use Ctrl+Enter to insert a newline.
 
 Included context is kept locally in the app until you send a prompt.
-Files with extensions accepted by the site are attached directly; other files
+Files with extensions accepted by the API are attached directly; other files
 are checked by their contents and recognized text is included with its path and
-contents. The site currently accepts PDF, DOCX, XLSX, PPTX, ODT, ODS, ODP,
+contents. The API currently accepts PDF, DOCX, XLSX, PPTX, ODT, ODS, ODP,
 TXT, TEXT, MD, MARKDOWN, CSV, TSV, JSON, JSONL, XML, HTML, HTM, LOG, YAML, YML,
 INI, CONF, CFG, TOML, ENV, SQL, PHP, JS, MJS, CJS, TS, TSX, JSX, PY, RB, GO,
 RS, JAVA, KT, KTS, SWIFT, C, H, CPP, CC, CXX, HPP, CS, M, SCALA, SH, BASH,
@@ -143,19 +114,14 @@ to append diagnostics to the path shown there; the default path is
 are independent: logging is active only when enabled and the path is nonempty.
 Clearing the path disables file logging without removing the checkbox setting.
 
-The app remembers the last project folder and reopens it next time. These
-preferences, the automatic Chrome startup setting, dark theme choice, and
-image-removal preference are stored in SQLite at
-`%LOCALAPPDATA%\Deepbrid Code\settings.sqlite3`. Automatic Chrome startup is
-enabled by default and can be changed in **Settings**. Toggle **Use dark mode**
-there to switch and save the app's appearance.
+The app remembers the last project folder and reopens it next time. Preferences,
+dark theme choice, and image-removal preference are stored in SQLite at
+`%LOCALAPPDATA%\Deepbrid Code\settings.sqlite3`; the API key is stored separately
+in the operating-system credential store. Toggle **Use dark mode** in
+**Settings** to switch and save the app's appearance.
 **Wrap text in file preview** is enabled by default and saved in the same
 settings database. Turn it off to use the preview's horizontal scrollbar;
 vertical and horizontal scrollbars are available in the preview.
 
 The app does not impose a separate character limit on the message field. Text
-context has a 256 KiB per-file limit and a 1 MiB total limit. Deepbrid AI Chat's
-maximum accepted message length is not documented here, so very large prompts
-may still be rejected or truncated by the website.
-
-Official API transport and richer project navigation are not implemented.
+context has a 256 KiB per-file limit and a 1 MiB total limit. Deepbrid's API message, attachment, and usage limits apply to all requests.
