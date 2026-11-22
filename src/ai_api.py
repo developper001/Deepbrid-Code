@@ -479,6 +479,52 @@ class DeepbridApiClient:
             json_body={"conversation_id": int(conversation_id)},
         )
 
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        image_format: str = "square",
+        quality: str = "auto",
+        conversation_id: str | None = None,
+    ) -> AiChatResponse:
+        if not prompt.strip():
+            raise DeepbridApiError("Enter a description for the image.")
+        if image_format not in {"square", "landscape", "portrait"}:
+            raise DeepbridApiError("Choose a supported image format.")
+        if quality not in {"auto", "low", "medium", "high"}:
+            raise DeepbridApiError("Choose a supported image quality.")
+
+        body: dict[str, object] = {
+            "prompt": prompt.strip(),
+            "format": image_format,
+            "quality": quality,
+        }
+        if conversation_id is not None:
+            body["conversation_id"] = int(conversation_id)
+        result = self._request("POST", "/image", json_body=body)
+        if not isinstance(result, dict):
+            raise DeepbridApiError("Deepbrid returned an invalid image response.")
+        returned_id = result.get("conversation_id")
+        next_conversation_id = (
+            str(returned_id)
+            if isinstance(returned_id, (int, str))
+            else conversation_id
+        )
+        message = result.get("message")
+        if not isinstance(message, dict):
+            raise DeepbridApiError("Deepbrid returned an invalid generated image.")
+        files = self._parse_media_files(message.get("files"))
+        if not files:
+            raise DeepbridApiError("Deepbrid did not return a generated image file.")
+        return AiChatResponse(
+            content=message.get("content")
+            if isinstance(message.get("content"), str)
+            else "",
+            conversation_id=next_conversation_id,
+            files=files,
+            zip_url=self._optional_string(message.get("zip_url")),
+        )
+
     def download_media(
         self,
         media_url: str,

@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 from types import TracebackType
 
 from PIL import Image, ImageGrab, ImageTk
@@ -141,6 +141,7 @@ class DeepbridCodeApp:
         self._startup_after_id: str | None = None
         self._initial_sash_set = False
         self.chat_request_active = False
+        self.image_generation_active = False
         self.chat_answer_started = False
         self.chat_stop_requested = False
         self.media_preview_images: list[ImageTk.PhotoImage] = []
@@ -315,6 +316,12 @@ class DeepbridCodeApp:
             command=self._add_additional_files,
         )
         self.add_files_button.pack(side="left", padx=(8, 0), pady=(4, 0))
+        self.generate_image_button = ttk.Button(
+            actions,
+            text="Generate image...",
+            command=self._generate_image_dialog,
+        )
+        self.generate_image_button.pack(side="left", padx=(8, 0), pady=(4, 0))
         self.model_selector = ttk.Combobox(
             actions,
             state="readonly",
@@ -1711,6 +1718,9 @@ class DeepbridCodeApp:
         if self.chat_request_active:
             self._stop_chat()
             return
+        if self.image_generation_active:
+            self.status.set("Wait for image generation to finish.")
+            return
         if not self.api_key:
             self.status.set("Add your Deepbrid Premium API key in Settings before sending.")
             return
@@ -1869,6 +1879,63 @@ class DeepbridCodeApp:
         else:
             self.chat_events.put(("chat-stop-success", conversation_id))
 
+    def _generate_image_dialog(self) -> None:
+        if self.chat_request_active or self.image_generation_active:
+            self.status.set("Wait for the current Deepbrid request to finish.")
+            return
+        if not self.api_key:
+            self.status.set("Add your Deepbrid Premium API key before generating images.")
+            return
+        prompt = simpledialog.askstring(
+            "Generate image",
+            "Describe the image to create:",
+            parent=self.root,
+        )
+        if prompt and prompt.strip():
+            self._start_image_generation(prompt.strip())
+
+    def _start_image_generation(self, prompt: str) -> None:
+        self.image_generation_active = True
+        self.generate_image_button.configure(state="disabled")
+        self.send_button.configure(state="disabled")
+        self.sessions_button.configure(state="disabled")
+        self._append_chat("You", f"Generate image: {prompt}")
+        self.status.set("Generating image with Deepbrid...")
+        self._start_progress()
+        worker = threading.Thread(
+            target=self._image_generation_worker,
+            args=(prompt, self.api_conversation_id),
+            name="deepbrid-image-generation",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self._set_image_generation_idle()
+            self.status.set(f"Could not start image generation: {error}")
+
+    def _image_generation_worker(
+        self,
+        prompt: str,
+        conversation_id: str | None,
+    ) -> None:
+        try:
+            response = DeepbridApiClient(self.api_key).generate_image(
+                prompt,
+                conversation_id=conversation_id,
+            )
+        except (DeepbridApiError, OSError, RuntimeError, ValueError) as error:
+            self.chat_events.put(("image-generation-error", str(error)))
+        else:
+            self.chat_events.put(("image-generation-success", response))
+
+    def _set_image_generation_idle(self) -> None:
+        self.image_generation_active = False
+        self.generate_image_button.configure(state="normal")
+        self.send_button.configure(state="normal")
+        self.sessions_button.configure(state="normal")
+        self._stop_progress()
+
     def _set_chat_idle(self) -> None:
         self.chat_request_active = False
         self.chat_stop_requested = False
@@ -1976,6 +2043,25 @@ class DeepbridCodeApp:
             elif event == "media-download-error":
                 error = str(payload)
                 self._log(f"Could not download Deepbrid media: {error}")
+                self.status.set(error)
+            elif event == "image-generation-success":
+                self._set_image_generation_idle()
+                if isinstance(payload, AiChatResponse):
+                    if payload.conversation_id is not None:
+                        self.api_conversation_id = payload.conversation_id
+                    self._append_chat(
+                        "Deepbrid AI",
+                        payload.content or "Generated image:",
+                        payload.files,
+                        payload.zip_url,
+                    )
+                    self.status.set("Deepbrid generated an image.")
+                else:
+                    self.status.set("Deepbrid returned an invalid generated image.")
+            elif event == "image-generation-error":
+                self._set_image_generation_idle()
+                error = str(payload)
+                self._append_chat("Deepbrid image generation status", error)
                 self.status.set(error)
             elif event == "chat-submitted":
                 if self.pending_remove_images_after_send:

@@ -290,6 +290,50 @@ class DeepbridApiClientTests(unittest.TestCase):
         )
         self.assertEqual(events[0][0], "start")
 
+    def test_image_generation_uses_documented_endpoint_and_options(self) -> None:
+        response = _Response(
+            {
+                "conversation_id": 42,
+                "message": {
+                    "content": "",
+                    "files": [
+                        {
+                            "id": 93,
+                            "kind": "generated",
+                            "name": "lighthouse.png",
+                            "size": 1200,
+                            "url": "/api/v1/ai/media?id=93",
+                        }
+                    ],
+                },
+            }
+        )
+        with patch("urllib.request.urlopen", return_value=response) as urlopen:
+            result = DeepbridApiClient("test-key").generate_image(
+                "A lighthouse at night",
+                image_format="landscape",
+                quality="high",
+                conversation_id="41",
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://www.deepbrid.com/api/v1/ai/image",
+        )
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {
+                "prompt": "A lighthouse at night",
+                "format": "landscape",
+                "quality": "high",
+                "conversation_id": 41,
+            },
+        )
+        self.assertEqual(result.conversation_id, "42")
+        self.assertEqual(result.files[0].kind, "generated")
+        self.assertEqual(result.files[0].mime, "")
+
     def test_stop_and_media_download_use_authenticated_ai_endpoints(self) -> None:
         with patch(
             "urllib.request.urlopen",

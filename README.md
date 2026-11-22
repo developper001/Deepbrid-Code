@@ -32,11 +32,25 @@ optional **Web** search before sending. Selected documents and images are
 uploaded through the official AI upload endpoint and attached to the message.
 Responses stream into the chat; choose **Stop** to stop a response. Generated
 images and files appear with save controls, and generated images can be
-previewed. Conversations are saved to the Deepbrid account; use
+previewed. Use **Generate image...** to create an image directly; it uses
+Deepbrid's default square format and automatic quality. Conversations are
+saved to the Deepbrid account; use
 **Conversations** to list, search, open, or start chats. Use **Prompts &
 Memory** to manage saved prompts and memories, or insert a saved prompt into
 your message. Messages, generated files, prompts, and memories are stored in
 your Deepbrid account, not in the local project.
+
+### Generate an image
+
+With a Premium API key configured, select **Generate image...** in the bottom
+toolbar and describe the image. Deepbrid Code sends the prompt to the
+documented `/ai/image` endpoint using square format and automatic quality. If a
+conversation is already open, the image is added there; otherwise Deepbrid
+creates a conversation. When generation finishes, use **Preview** to view the
+image or **Save ...** to download it to your computer. Image generation is
+subject to Deepbrid's API limits.
+
+![Deepbrid Code image generation workflow](src/img/screenshots/image-gen.png)
 
 If the key is missing or rejected, add or correct it in **Settings**. API
 features require Premium and remain subject to Deepbrid's daily and rate limits.

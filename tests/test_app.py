@@ -767,6 +767,35 @@ class AppStartupTests(unittest.TestCase):
             finally:
                 root.destroy()
 
+    def test_generate_image_action_uses_prompt_and_current_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", root_path / "settings.sqlite3"),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.api_key = "test-api-key"
+                    app.api_conversation_id = "42"
+                    with (
+                        patch("src.app.simpledialog.askstring", return_value="A lighthouse"),
+                        patch("src.app.threading.Thread") as thread,
+                    ):
+                        app._generate_image_dialog()
+
+                    self.assertTrue(app.image_generation_active)
+                    self.assertEqual(
+                        thread.call_args.kwargs["args"],
+                        ("A lighthouse", "42"),
+                    )
+                    self.assertIn("Generate image: A lighthouse", app.chat_output.get("1.0", "end"))
+                    app._set_image_generation_idle()
+            finally:
+                root.destroy()
+
     def test_personalization_dialog_builds_prompt_and_memory_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = tk.Tk()
