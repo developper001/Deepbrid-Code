@@ -6,6 +6,7 @@ from tkinter import filedialog, ttk
 from typing import Callable, Protocol
 
 from .settings import (
+    API_KEY,
     AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
@@ -16,6 +17,8 @@ from .settings import (
 
 class SettingsBackend(Protocol):
     def set_bool(self, name: str, value: bool) -> None: ...
+    def get(self, name: str) -> str | None: ...
+    def set(self, name: str, value: str) -> None: ...
 
 
 class SettingsDialog:
@@ -35,6 +38,9 @@ class SettingsDialog:
         on_diagnostics_enabled_changed: Callable[[bool], None],
         output_log_path: str,
         on_output_logging_changed: Callable[[str], None],
+        api_key: str = "",
+        on_api_key_changed: Callable[[str], None] | None = None,
+        on_get_api_key: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.on_auto_open_changed = on_auto_open_changed
@@ -43,6 +49,8 @@ class SettingsDialog:
         self.on_remove_images_after_send_changed = on_remove_images_after_send_changed
         self.on_diagnostics_enabled_changed = on_diagnostics_enabled_changed
         self.on_output_logging_changed = on_output_logging_changed
+        self.on_api_key_changed = on_api_key_changed
+        self.on_get_api_key = on_get_api_key
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
         self.dialog.geometry("640x560")
@@ -201,8 +209,63 @@ class SettingsDialog:
             sticky="w",
             pady=(4, 0),
         )
+        ttk.Separator(content).grid(row=14, column=0, sticky="ew", pady=(14, 10))
+        ttk.Label(content, text="Deepbrid AI API", font=("TkDefaultFont", 12, "bold")).grid(
+            row=15,
+            column=0,
+            sticky="w",
+            pady=(0, 6),
+        )
+        ttk.Label(
+            content,
+            text="API key for direct, official AI requests (Premium required).",
+            wraplength=420,
+            justify="left",
+        ).grid(row=16, column=0, sticky="w")
+        api_key_controls = ttk.Frame(content)
+        api_key_controls.grid(row=17, column=0, sticky="ew", pady=(6, 0))
+        api_key_controls.columnconfigure(0, weight=1)
+        self.api_key = tk.StringVar(master=self.dialog, value=api_key)
+        self.api_key_entry = ttk.Entry(
+            api_key_controls,
+            textvariable=self.api_key,
+            show="*",
+        )
+        self.api_key_entry.grid(row=0, column=0, sticky="ew")
+
+        def toggle_api_key_visibility() -> None:
+            visible = self.api_key_entry.cget("show") == "*"
+            self.api_key_entry.configure(show="" if visible else "*")
+            api_key_visibility.configure(text="Hide" if visible else "Show")
+
+        api_key_visibility = ttk.Button(
+            api_key_controls,
+            text="Show",
+            command=toggle_api_key_visibility,
+        )
+        api_key_visibility.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            api_key_controls,
+            text="Get API key",
+            command=self.on_get_api_key or (lambda: None),
+        ).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(
+            api_key_controls,
+            text="Save",
+            command=self._save_api_key,
+        ).grid(row=0, column=3, padx=(8, 0))
+        self.api_key_status = tk.StringVar(
+            master=self.dialog,
+            value="Direct API is used when an API key is saved." if api_key else "Chrome fallback is active.",
+        )
+        ttk.Label(content, textvariable=self.api_key_status).grid(
+            row=18,
+            column=0,
+            sticky="w",
+            pady=(4, 0),
+        )
         ttk.Label(content, textvariable=self.status).grid(
-            row=14,
+            row=19,
             column=0,
             sticky="w",
             pady=(8, 0),
@@ -220,6 +283,7 @@ class SettingsDialog:
         self.saved_remove_images_after_send = remove_images_after_send
         self.saved_diagnostics_enabled = diagnostics_enabled
         self.saved_output_log_path = output_log_path
+        self.saved_api_key = api_key
 
     def _save(self) -> None:
         enabled = self.enabled.get()
@@ -336,3 +400,18 @@ class SettingsDialog:
     def _clear_output_log_path(self) -> None:
         self.output_log_path.set("")
         self._save_output_logging()
+
+    def _save_api_key(self) -> None:
+        key = self.api_key.get().strip()
+        if self.on_api_key_changed is None:
+            return
+        try:
+            self.on_api_key_changed(key)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.api_key.set(self.saved_api_key)
+            self.api_key_status.set(f"Could not save API key: {error}")
+            return
+        self.saved_api_key = key
+        self.api_key_status.set(
+            "Direct API is active." if key else "Chrome fallback is active."
+        )

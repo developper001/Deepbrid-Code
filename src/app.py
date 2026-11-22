@@ -7,6 +7,7 @@ import tempfile
 import threading
 import tkinter as tk
 import traceback
+import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from types import TracebackType
 
 from PIL import Image, ImageGrab, ImageTk
 
+from .ai_api import DeepbridApiClient, DeepbridApiError
 from .browser import BrowserLaunchError, ChatSession, DeepbridChatBrowser
 from .context import (
     ContextFile,
@@ -28,6 +30,7 @@ from .context import (
 )
 from .logo import create_brand_icon
 from .settings import (
+    API_KEY,
     AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
@@ -93,6 +96,8 @@ class DeepbridCodeApp:
             self.diagnostics_enabled and bool(self.output_log_path.strip())
         )
         self.last_project = self.settings.get(LAST_PROJECT)
+        self.api_key = self.settings.get(API_KEY) or ""
+        self.api_conversation_id: int | None = None
         self.project_root: Path | None = None
         self.tree_paths: dict[str, Path] = {}
         self.tree_directories: dict[str, Path] = {}
@@ -500,6 +505,9 @@ class DeepbridCodeApp:
                 self._set_diagnostics_enabled,
                 self.output_log_path,
                 self._set_output_logging,
+                self.api_key,
+                self._set_api_key,
+                lambda: webbrowser.open("https://www.deepbrid.com/devices"),
             )
         except (OSError, sqlite3.Error) as error:
             self.status.set(f"Could not open Settings: {error}")
@@ -514,6 +522,13 @@ class DeepbridCodeApp:
     def _set_wrap_text(self, enabled: bool) -> None:
         self.wrap_text = enabled
         self.preview.configure(wrap="word" if enabled else "none")
+
+    def _set_api_key(self, key: str) -> None:
+        normalized = key.strip()
+        self.settings.set(API_KEY, normalized)
+        self.api_key = normalized
+        self.api_conversation_id = None
+        self._log("Deepbrid AI API key updated." if normalized else "Deepbrid AI API key cleared.")
 
     def _set_remove_images_after_send(self, enabled: bool) -> None:
         self.remove_images_after_send = enabled
@@ -1549,16 +1564,31 @@ class DeepbridCodeApp:
         web_enabled: bool,
     ) -> None:
         try:
-            response = self.chat_browser.send_message(
-                prompt,
-                attachment_paths,
-                project_root,
-                external_attachment_paths,
-                on_submitted=lambda: self.chat_events.put(("chat-submitted", "")),
-                model=model,
-                mode=mode,
-                web_enabled=web_enabled,
-            )
+            if self.api_key:
+                client = DeepbridApiClient(self.api_key)
+                response, conversation_id = client.chat(
+                    prompt,
+                    model=model,
+                    use_web=web_enabled,
+                    conversation_id=self.api_conversation_id,
+                    attachment_paths=attachment_paths,
+                )
+                self.api_conversation_id = conversation_id
+                self.chat_events.put(("chat-submitted", ""))
+            else:
+                response = self.chat_browser.send_message(
+                    prompt,
+                    attachment_paths,
+                    project_root,
+                    external_attachment_paths,
+                    on_submitted=lambda: self.chat_events.put(("chat-submitted", "")),
+                    model=model,
+                    mode=mode,
+                    web_enabled=web_enabled,
+                )
+        except DeepbridApiError as error:
+            self._log(f"Deepbrid AI API request failed: {error}")
+            self.chat_events.put(("chat-error", str(error)))
         except BrowserLaunchError as error:
             self._log(f"Chat request failed: {error}")
             self.chat_events.put(("chat-error", str(error)))

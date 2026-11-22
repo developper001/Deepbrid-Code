@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from src.settings import (
+    API_KEY,
     AUTO_OPEN_CHROME,
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
@@ -27,6 +28,7 @@ class SettingsStoreTests(unittest.TestCase):
             store.set_bool(WRAP_TEXT, False)
             store.set_bool(DIAGNOSTICS_ENABLED, True)
             store.set(LAST_PROJECT, "C:/projects/example")
+            store.set(API_KEY, "test-api-key")
 
             reopened = SettingsStore(store.database_path)
             self.assertFalse(reopened.get_bool(AUTO_OPEN_CHROME, default=True))
@@ -34,6 +36,7 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertFalse(reopened.get_bool(WRAP_TEXT, default=True))
             self.assertTrue(reopened.get_bool(DIAGNOSTICS_ENABLED, default=False))
             self.assertEqual(reopened.get(LAST_PROJECT), "C:/projects/example")
+            self.assertEqual(reopened.get(API_KEY), "test-api-key")
 
     def test_invalid_boolean_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

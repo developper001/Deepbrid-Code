@@ -23,10 +23,16 @@ python -m unittest discover -s tests -v
 
 ## Current chat limitations
 
-The documented Deepbrid API does not provide a public AI-chat endpoint. This
-app controls the dedicated Chrome profile through Chrome's loopback-only
-DevTools interface and interacts with the visible AI Chat page; it does not
-call or reverse-engineer private chat endpoints.
+For an official programmatic integration, add your Deepbrid API key in
+**Settings**. Deepbrid's documented `/api/v1/ai/chat` and `/api/v1/ai/upload`
+endpoints support Premium accounts, JSON/SSE chat responses, attachments,
+conversation continuity, Web search, and model selection. API requests use
+`Authorization: Bearer ...` and do not read browser cookies.
+
+Without a configured API key, the app continues to control the dedicated Chrome
+profile through Chrome's loopback-only DevTools interface and interact with the
+visible AI Chat page. This fallback does not inspect network requests or depend
+on undocumented chat endpoints.
 
 **Open Deepbrid AI Chat** launches Google Chrome with a separate profile under
 `%LOCALAPPDATA%\Deepbrid Code\chrome-profile`. Sign in yourself in that window.
