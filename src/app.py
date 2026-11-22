@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sqlite3
@@ -45,10 +46,20 @@ from .settings import (
     LAST_PROJECT,
     OUTPUT_LOG_PATH,
     REMOVE_IMAGES_AFTER_SEND,
+    TERMINAL_COMMAND_WHITELIST,
+    TERMINAL_TOOLS_ENABLED,
     WRAP_TEXT,
     SettingsStore,
 )
 from .settings_dialog import SettingsDialog
+from .terminal_tools import (
+    TerminalCommandResult,
+    add_terminal_tool_instructions,
+    load_terminal_command_whitelist,
+    normalize_terminal_commands,
+    parse_terminal_tool_request,
+    run_allowed_terminal_command,
+)
 
 APP_DATA_DIR = Path(
     os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
@@ -57,6 +68,7 @@ SETTINGS_DATABASE = APP_DATA_DIR / "settings.sqlite3"
 APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_LOG_PATH = APP_ROOT / "diagnostics" / "deepbrid-code.log"
 MAX_IMAGE_PREVIEW_BYTES = 20 * 1024 * 1024
+MAX_TERMINAL_TOOL_CALLS_PER_TURN = 3
 APP_ICON_PATH = Path(__file__).parent / "assets" / "deepbrid-code.ico"
 FALLBACK_MODELS = (
     AiModel("gpt-6.1-sol", "GPT-6.1 Sol · Best"),
@@ -89,6 +101,13 @@ class DeepbridCodeApp:
         self.diagnostics_enabled = self.settings.get_bool(
             DIAGNOSTICS_ENABLED,
             default=False,
+        )
+        self.allow_terminal_tools = self.settings.get_bool(
+            TERMINAL_TOOLS_ENABLED,
+            default=False,
+        )
+        self.allowed_terminal_commands = load_terminal_command_whitelist(
+            self.settings.get(TERMINAL_COMMAND_WHITELIST)
         )
         self.output_log_enabled = (
             self.diagnostics_enabled and bool(self.output_log_path.strip())
@@ -144,6 +163,11 @@ class DeepbridCodeApp:
         self.image_generation_active = False
         self.chat_answer_started = False
         self.chat_stop_requested = False
+        self.chat_tool_mode = False
+        self.terminal_tool_calls = 0
+        self.active_chat_options: tuple[str, str | None, bool] | None = None
+        self.active_project_root: Path | None = None
+        self.active_terminal_commands: tuple[str, ...] = ()
         self.media_preview_images: list[ImageTk.PhotoImage] = []
 
         self._build_ui()
@@ -198,6 +222,18 @@ class DeepbridCodeApp:
         self.assistant_selector.set("Default")
         self.assistant_selector.pack(side="left")
         self.assistant_selector.bind("<<ComboboxSelected>>", self._assistant_changed)
+        self.terminal_tools_var = tk.BooleanVar(
+            master=self.root,
+            value=self.allow_terminal_tools,
+        )
+        self.terminal_tools_button = ttk.Checkbutton(
+            toolbar,
+            text="Allow safe commands",
+            variable=self.terminal_tools_var,
+            command=self._set_terminal_tools_enabled,
+            style="Toolbutton",
+        )
+        self.terminal_tools_button.pack(side="left", padx=(12, 0))
 
         self.workspace = ttk.Panedwindow(self.root, orient="vertical")
         self.workspace.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -377,6 +413,30 @@ class DeepbridCodeApp:
             return
         self._load_project(Path(selected))
 
+    def _set_terminal_tools_enabled(self) -> None:
+        enabled = self.terminal_tools_var.get()
+        if enabled and self.project_root is None:
+            self.terminal_tools_var.set(False)
+            self.status.set("Open a project folder before enabling safe commands.")
+            return
+        if enabled and not self.allowed_terminal_commands:
+            self.terminal_tools_var.set(False)
+            self.status.set("Enable at least one command in Settings first.")
+            return
+        try:
+            self.settings.set_bool(TERMINAL_TOOLS_ENABLED, enabled)
+        except sqlite3.Error as error:
+            self.terminal_tools_var.set(self.allow_terminal_tools)
+            self.status.set(f"Could not save terminal tool preference: {error}")
+            self._log(f"Could not save terminal tool preference: {error}")
+            return
+        self.allow_terminal_tools = enabled
+        self.status.set(
+            "Safe commands enabled; the assistant must get your approval for every run."
+            if enabled
+            else "Safe commands disabled."
+        )
+
     def _add_additional_files(self) -> None:
         extensions = sorted(UPLOAD_FILE_EXTENSIONS | UPLOAD_IMAGE_EXTENSIONS)
         patterns = " ".join(f"*{extension}" for extension in extensions)
@@ -522,6 +582,8 @@ class DeepbridCodeApp:
                 self._set_output_logging,
                 self.api_key,
                 self._set_api_key,
+                self.allowed_terminal_commands,
+                self._set_terminal_command_whitelist,
             )
         except (OSError, sqlite3.Error) as error:
             self.status.set(f"Could not open Settings: {error}")
@@ -555,6 +617,20 @@ class DeepbridCodeApp:
 
     def _set_remove_images_after_send(self, enabled: bool) -> None:
         self.remove_images_after_send = enabled
+
+    def _set_terminal_command_whitelist(
+        self,
+        commands: tuple[str, ...],
+    ) -> None:
+        normalized = normalize_terminal_commands(commands)
+        if not normalized:
+            raise ValueError("Enable at least one command in the whitelist.")
+        self.settings.set(
+            TERMINAL_COMMAND_WHITELIST,
+            json.dumps(list(normalized)),
+        )
+        self.allowed_terminal_commands = normalized
+        self.status.set("Saved terminal command whitelist.")
 
     def _assistant_changed(self, _event: tk.Event) -> None:
         selected = self.assistant_selector.get()
@@ -1756,9 +1832,32 @@ class DeepbridCodeApp:
         web_enabled = self.web_var.get()
         self.ai_model = self.model_selector.get()
         self.web_enabled = web_enabled
+        self.active_project_root = (
+            self.project_root
+            if (
+                self.allow_terminal_tools
+                and self.project_root is not None
+                and self.allowed_terminal_commands
+            )
+            else None
+        )
+        self.active_terminal_commands = (
+            self.allowed_terminal_commands
+            if self.active_project_root is not None
+            else ()
+        )
+        self.chat_tool_mode = self.active_project_root is not None
+        self.terminal_tool_calls = 0
+        self.active_chat_options = (selected_model, selected_assistant, web_enabled)
+        api_prompt = (
+            add_terminal_tool_instructions(prompt, self.active_terminal_commands)
+            if self.chat_tool_mode
+            else prompt
+        )
         self.chat_request_active = True
         self.chat_stop_requested = False
         self.chat_answer_started = False
+        self.terminal_tools_button.configure(state="disabled")
         self.send_button.configure(
             text="Stop",
             command=self._stop_chat,
@@ -1767,7 +1866,8 @@ class DeepbridCodeApp:
         self._log(
             f"Sending prompt with {len(self.context_files)} context item(s) "
             f"and {len(attachment_paths)} attachment(s), model {selected_model}, "
-            f"assistant {selected_assistant or 'default'}, Web {'on' if web_enabled else 'off'}."
+            f"assistant {selected_assistant or 'default'}, Web {'on' if web_enabled else 'off'}, "
+            f"safe terminal tools {'on' if self.chat_tool_mode else 'off'}."
         )
         self._append_chat("You", prompt)
         if attachment_paths:
@@ -1781,7 +1881,7 @@ class DeepbridCodeApp:
         worker = threading.Thread(
             target=self._chat_worker,
             args=(
-                prompt,
+                api_prompt,
                 attachment_paths,
                 selected_model,
                 selected_assistant,
@@ -1816,7 +1916,7 @@ class DeepbridCodeApp:
                         self.chat_events.put(("chat-submitted", None))
                 elif not event_name:
                     text = payload.get("t")
-                    if isinstance(text, str):
+                    if isinstance(text, str) and not self.chat_tool_mode:
                         self.chat_events.put(("chat-delta", text))
                 elif event_name == "status":
                     stage = payload.get("stage")
@@ -1847,6 +1947,155 @@ class DeepbridCodeApp:
         finally:
             if self.cleanup_clipboard_after_chat:
                 self._cleanup_clipboard_images()
+
+    def _handle_terminal_tool_request(self, command: str) -> None:
+        project_root = self.active_project_root
+        if (
+            command not in self.active_terminal_commands
+            or command not in self.allowed_terminal_commands
+        ):
+            self._set_chat_idle()
+            message = "The requested command is not in your enabled whitelist."
+            self._append_chat("Terminal tool status", message)
+            self.status.set(message)
+            return
+        if not self.allow_terminal_tools or project_root is None:
+            self._set_chat_idle()
+            message = (
+                "The command was not run because safe terminal tools are disabled "
+                "or no project folder is open."
+            )
+            self._append_chat(
+                "Terminal tool status",
+                message,
+            )
+            self.status.set(message)
+            return
+        if self.terminal_tool_calls >= MAX_TERMINAL_TOOL_CALLS_PER_TURN:
+            self._set_chat_idle()
+            self._append_chat(
+                "Terminal tool status",
+                "The command was not run because this turn reached its limit of "
+                f"{MAX_TERMINAL_TOOL_CALLS_PER_TURN} command requests.",
+            )
+            return
+
+        self.terminal_tool_calls += 1
+        approved = messagebox.askyesno(
+            "Approve terminal command",
+            f"The assistant requests this allowlisted command:\n\n{command}\n\n"
+            f"Working directory:\n{project_root}\n\n"
+            "It will run only if you approve it.",
+            parent=self.root,
+        )
+        if not approved:
+            self._start_terminal_followup(
+                command,
+                result=None,
+                denial="The user declined to run this command.",
+            )
+            return
+
+        self.status.set(f"Running approved command: {command}")
+        self.send_button.configure(
+            text="Running command...",
+            command=self._stop_chat,
+            state="disabled",
+        )
+        worker = threading.Thread(
+            target=self._terminal_command_worker,
+            args=(command, project_root, self.active_terminal_commands),
+            name="deepbrid-terminal-command",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self._set_chat_idle()
+            message = f"Could not start the approved command: {error}"
+            self._append_chat("Terminal tool status", message)
+            self.status.set(message)
+
+    def _terminal_command_worker(
+        self,
+        command: str,
+        project_root: Path,
+        allowed_commands: tuple[str, ...],
+    ) -> None:
+        try:
+            result = run_allowed_terminal_command(
+                command,
+                project_root,
+                allowed_commands,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            self.chat_events.put(("terminal-command-error", str(error)))
+        else:
+            self.chat_events.put(("terminal-command-success", result))
+
+    def _start_terminal_followup(
+        self,
+        command: str,
+        *,
+        result: TerminalCommandResult | None,
+        denial: str | None = None,
+    ) -> None:
+        if result is None:
+            tool_result = f"Command not run: {denial or 'execution failed.'}"
+            transcript = f"{command}\n{tool_result}"
+            self.status.set("Command declined. Asking Deepbrid to continue without it...")
+        else:
+            tool_result = (
+                f"Command: {result.command}\n"
+                f"Working directory: {result.working_directory}\n"
+                f"Exit code: {result.exit_code}\n"
+                f"Standard output:\n{result.stdout or '(empty)'}\n"
+                f"Standard error:\n{result.stderr or '(empty)'}"
+            )
+            transcript = tool_result
+            self.status.set("Sending the approved command result to Deepbrid...")
+        self._append_chat("Terminal", transcript)
+
+        options = self.active_chat_options
+        if options is None:
+            self._set_chat_idle()
+            message = "Could not continue because the original chat options are unavailable."
+            self._append_chat("Terminal tool status", message)
+            self.status.set(message)
+            return
+
+        model, assistant, web_enabled = options
+        api_prompt = (
+            add_terminal_tool_instructions(
+                tool_result,
+                self.active_terminal_commands,
+            )
+            if self.chat_tool_mode
+            else tool_result
+        )
+        self.chat_request_active = True
+        self.chat_stop_requested = False
+        self.chat_answer_started = False
+        self.terminal_tools_button.configure(state="disabled")
+        self.send_button.configure(
+            text="Stop",
+            command=self._stop_chat,
+            state="normal" if self.api_conversation_id else "disabled",
+        )
+        self._start_progress()
+        worker = threading.Thread(
+            target=self._chat_worker,
+            args=(api_prompt, [], model, assistant, web_enabled),
+            name="deepbrid-chat-tool-followup",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self._set_chat_idle()
+            message = f"Could not continue the chat after the terminal tool: {error}"
+            self._append_chat("Terminal tool status", message)
+            self.status.set(message)
 
     def _stop_chat(self) -> None:
         if not self.chat_request_active or self.chat_stop_requested:
@@ -1939,11 +2188,16 @@ class DeepbridCodeApp:
     def _set_chat_idle(self) -> None:
         self.chat_request_active = False
         self.chat_stop_requested = False
+        self.chat_tool_mode = False
+        self.active_chat_options = None
+        self.active_project_root = None
+        self.active_terminal_commands = ()
         self.send_button.configure(
             text="Send",
             command=self._send,
             state="normal",
         )
+        self.terminal_tools_button.configure(state="normal")
         self._stop_progress()
 
     def _append_stream_chunk(self, chunk: str) -> None:
@@ -1962,6 +2216,23 @@ class DeepbridCodeApp:
                 event, payload = self.chat_events.get_nowait()
             except queue.Empty:
                 break
+            if event == "chat-success" and isinstance(payload, AiChatResponse):
+                if self.chat_tool_mode and not payload.stopped:
+                    try:
+                        command = parse_terminal_tool_request(
+                            payload.content,
+                            self.active_terminal_commands,
+                        )
+                    except ValueError as error:
+                        self._set_chat_idle()
+                        self._append_chat("Terminal tool status", str(error))
+                        self.status.set(str(error))
+                        continue
+                    if command is not None:
+                        if payload.conversation_id is not None:
+                            self.api_conversation_id = payload.conversation_id
+                        self._handle_terminal_tool_request(command)
+                        continue
             if event in {"chat-success", "chat-error"}:
                 self._set_chat_idle()
             if event == "chat-start":
@@ -2022,6 +2293,19 @@ class DeepbridCodeApp:
                 error = str(payload)
                 self._append_chat("Deepbrid AI Chat status", error)
                 self.status.set(error)
+            elif event == "terminal-command-success":
+                if isinstance(payload, TerminalCommandResult):
+                    self._start_terminal_followup(payload.command, result=payload)
+                else:
+                    self._set_chat_idle()
+                    message = "The approved command returned an invalid result."
+                    self._append_chat("Terminal tool status", message)
+                    self.status.set(message)
+            elif event == "terminal-command-error":
+                self._set_chat_idle()
+                error = str(payload)
+                self._append_chat("Terminal tool status", error)
+                self.status.set(error)
             elif event == "chat-stop-success":
                 if self.chat_request_active:
                     self.status.set("Deepbrid accepted the stop request.")
@@ -2064,7 +2348,7 @@ class DeepbridCodeApp:
                 self._append_chat("Deepbrid image generation status", error)
                 self.status.set(error)
             elif event == "chat-submitted":
-                if self.pending_remove_images_after_send:
+                if self.pending_remove_images_after_send and self.pending_image_context_keys:
                     self._remove_context_keys(self.pending_image_context_keys)
                 self.pending_image_context_keys = []
         self._poll_console_events()

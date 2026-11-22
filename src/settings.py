@@ -15,6 +15,8 @@ WRAP_TEXT = "wrap_text"
 OUTPUT_LOG_PATH = "output_log_path"
 DIAGNOSTICS_ENABLED = "diagnostics_enabled"
 REMOVE_IMAGES_AFTER_SEND = "remove_images_after_send"
+TERMINAL_TOOLS_ENABLED = "terminal_tools_enabled"
+TERMINAL_COMMAND_WHITELIST = "terminal_command_whitelist"
 API_KEY = "api_key"
 KEYRING_SERVICE = "Deepbrid Code"
 

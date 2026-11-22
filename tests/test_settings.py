@@ -10,6 +10,8 @@ from src.settings import (
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
     LAST_PROJECT,
+    TERMINAL_COMMAND_WHITELIST,
+    TERMINAL_TOOLS_ENABLED,
     WRAP_TEXT,
     SettingsStore,
 )
@@ -21,16 +23,27 @@ class SettingsStoreTests(unittest.TestCase):
             store = SettingsStore(Path(temporary_directory) / "settings.sqlite3")
             self.assertTrue(store.get_bool(WRAP_TEXT, default=True))
             self.assertFalse(store.get_bool(DIAGNOSTICS_ENABLED, default=False))
+            self.assertFalse(store.get_bool(TERMINAL_TOOLS_ENABLED, default=False))
 
             store.set_bool(DARK_THEME, True)
             store.set_bool(WRAP_TEXT, False)
             store.set_bool(DIAGNOSTICS_ENABLED, True)
+            store.set_bool(TERMINAL_TOOLS_ENABLED, True)
+            store.set(
+                TERMINAL_COMMAND_WHITELIST,
+                '["ls","python --version"]',
+            )
             store.set(LAST_PROJECT, "C:/projects/example")
 
             reopened = SettingsStore(store.database_path)
             self.assertTrue(reopened.get_bool(DARK_THEME, default=False))
             self.assertFalse(reopened.get_bool(WRAP_TEXT, default=True))
             self.assertTrue(reopened.get_bool(DIAGNOSTICS_ENABLED, default=False))
+            self.assertTrue(reopened.get_bool(TERMINAL_TOOLS_ENABLED, default=False))
+            self.assertEqual(
+                reopened.get(TERMINAL_COMMAND_WHITELIST),
+                '["ls","python --version"]',
+            )
             self.assertEqual(reopened.get(LAST_PROJECT), "C:/projects/example")
 
     def test_invalid_boolean_is_reported(self) -> None:

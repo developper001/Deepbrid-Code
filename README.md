@@ -123,6 +123,30 @@ The app opens at 1180x760, with the project files pane using about one quarter
 of the window width and most space reserved for chat. Each prompt in the
 in-memory conversation is preceded by a timestamped separator.
 
+## Safe terminal tools
+
+Open a project folder and enable **Allow safe commands** in the top toolbar
+to let the assistant request a small set of local development operations. This
+option is off by default. Every request shows the exact command and project
+directory in a confirmation dialog; declining prevents execution. Approved
+commands are limited to the built-in list below. Use **Settings** >
+**Command whitelist...** to choose which of these commands the assistant may
+request; custom commands cannot be added:
+
+- `ls` (lists the open project folder)
+- `git status --short --branch`
+- `python --version`
+- `python -m unittest discover -s tests -v`
+- `python -m compileall -q src tests`
+
+Commands run in the project directory used for that chat. The app does not
+invoke a shell or accept arbitrary commands, arguments, Python snippets, or
+script paths. The test command does execute the project's test code, so approve
+it only when you trust that code. Results are returned to Deepbrid AI Chat so
+the assistant can continue. Deepbrid's API does not expose native tool
+calling, so this feature uses a constrained response protocol and the assistant
+may not always request a command in the expected format.
+
 ## Console and preferences
 
 Use **Toggle Console** to show or hide timestamped application diagnostics and
@@ -135,7 +159,8 @@ are independent: logging is active only when enabled and the path is nonempty.
 Clearing the path disables file logging without removing the checkbox setting.
 
 The app remembers the last project folder and reopens it next time. Preferences,
-dark theme choice, and image-removal preference are stored in SQLite at
+including dark theme, image removal, and safe terminal tool choices, are stored
+in SQLite at
 `%LOCALAPPDATA%\Deepbrid Code\settings.sqlite3`; the API key is stored separately
 in the operating-system credential store. Toggle **Use dark mode** in
 **Settings** to switch and save the app's appearance.

@@ -12,9 +12,11 @@ from .settings import (
     SecretStorageError,
     WRAP_TEXT,
 )
+from .terminal_tools import ALLOWED_TERMINAL_COMMANDS, normalize_terminal_commands
 
 
 class SettingsBackend(Protocol):
+    def set(self, name: str, value: str) -> None: ...
     def set_bool(self, name: str, value: bool) -> None: ...
     def set_secret(self, name: str, value: str) -> None: ...
 
@@ -36,6 +38,8 @@ class SettingsDialog:
         on_output_logging_changed: Callable[[str], None],
         api_key: str = "",
         on_api_key_changed: Callable[[str], None] | None = None,
+        allowed_terminal_commands: tuple[str, ...] = ALLOWED_TERMINAL_COMMANDS,
+        on_terminal_commands_changed: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         self.settings = settings
         self.on_dark_theme_changed = on_dark_theme_changed
@@ -44,6 +48,11 @@ class SettingsDialog:
         self.on_diagnostics_enabled_changed = on_diagnostics_enabled_changed
         self.on_output_logging_changed = on_output_logging_changed
         self.on_api_key_changed = on_api_key_changed
+        self.allowed_terminal_commands = normalize_terminal_commands(
+            allowed_terminal_commands
+        )
+        self.on_terminal_commands_changed = on_terminal_commands_changed
+        self.terminal_whitelist_dialog: TerminalWhitelistDialog | None = None
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
         self.dialog.geometry("640x560")
@@ -80,6 +89,7 @@ class SettingsDialog:
         content = ttk.Frame(frame, padding=12, relief="groove")
         content.grid(row=0, column=1, sticky="nsew")
         content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=0)
         ttk.Label(content, text="Deepbrid AI API", font=("TkDefaultFont", 14, "bold")).grid(
             row=0,
             column=0,
@@ -170,6 +180,18 @@ class SettingsDialog:
             variable=self.remove_images_after_send,
             command=self._save_remove_images_after_send,
         ).grid(row=9, column=0, sticky="w", pady=(6, 0))
+        self.terminal_whitelist_button = ttk.Button(
+            content,
+            text="Command whitelist...",
+            command=self._open_terminal_whitelist,
+            state="normal" if on_terminal_commands_changed else "disabled",
+        )
+        self.terminal_whitelist_button.grid(
+            row=9,
+            column=1,
+            sticky="e",
+            padx=(8, 0),
+        )
         ttk.Separator(content).grid(row=10, column=0, sticky="ew", pady=(14, 10))
         ttk.Label(content, text="Diagnostics", font=("TkDefaultFont", 12, "bold")).grid(
             row=11,
@@ -256,6 +278,25 @@ class SettingsDialog:
         self.saved_diagnostics_enabled = diagnostics_enabled
         self.saved_output_log_path = output_log_path
         self.saved_api_key = api_key
+
+    def _open_terminal_whitelist(self) -> None:
+        if self.on_terminal_commands_changed is None:
+            return
+        self.terminal_whitelist_dialog = TerminalWhitelistDialog(
+            self.dialog,
+            self.allowed_terminal_commands,
+            self._save_terminal_commands,
+        )
+
+    def _save_terminal_commands(self, commands: tuple[str, ...]) -> None:
+        if self.on_terminal_commands_changed is None:
+            return
+        normalized = normalize_terminal_commands(commands)
+        if not normalized:
+            raise ValueError("Enable at least one command in the whitelist.")
+        self.on_terminal_commands_changed(normalized)
+        self.allowed_terminal_commands = normalized
+        self.status.set("Saved terminal command whitelist.")
 
     def _save_dark_theme(self) -> None:
         enabled = self.dark_theme.get()
@@ -375,3 +416,75 @@ class SettingsDialog:
         self.api_key_status.set(
             "API key saved." if key else "API key removed."
         )
+
+
+class TerminalWhitelistDialog:
+    def __init__(
+        self,
+        parent: tk.Toplevel,
+        allowed_commands: tuple[str, ...],
+        on_save: Callable[[tuple[str, ...]], None],
+    ) -> None:
+        self.on_save = on_save
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Terminal command whitelist")
+        self.dialog.geometry("680x380")
+        self.dialog.minsize(600, 340)
+        self.dialog.transient(parent)
+
+        frame = ttk.Frame(self.dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=(
+                "Choose which built-in commands the assistant may request. "
+                "Custom commands are not supported. You will still approve "
+                "each command before it runs."
+            ),
+            wraplength=640,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 12))
+
+        selected_commands = set(normalize_terminal_commands(allowed_commands))
+        self.command_vars = {
+            command: tk.BooleanVar(
+                master=self.dialog,
+                value=command in selected_commands,
+            )
+            for command in ALLOWED_TERMINAL_COMMANDS
+        }
+        for command in ALLOWED_TERMINAL_COMMANDS:
+            ttk.Checkbutton(
+                frame,
+                text=command,
+                variable=self.command_vars[command],
+            ).pack(anchor="w", pady=2)
+
+        self.status = tk.StringVar(master=self.dialog)
+        ttk.Label(frame, textvariable=self.status).pack(anchor="w", pady=(8, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.dialog.destroy).pack(
+            side="right",
+        )
+        ttk.Button(buttons, text="Save", command=self._save).pack(
+            side="right",
+            padx=(0, 8),
+        )
+        self.dialog.grab_set()
+
+    def _save(self) -> None:
+        commands = tuple(
+            command
+            for command in ALLOWED_TERMINAL_COMMANDS
+            if self.command_vars[command].get()
+        )
+        if not commands:
+            self.status.set("Enable at least one command in the whitelist.")
+            return
+        try:
+            self.on_save(commands)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.status.set(f"Could not save terminal command whitelist: {error}")
+            return
+        self.dialog.destroy()

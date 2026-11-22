@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import tkinter as tk
@@ -20,11 +21,14 @@ from src.settings import (
     LAST_PROJECT,
     OUTPUT_LOG_PATH,
     REMOVE_IMAGES_AFTER_SEND,
+    TERMINAL_COMMAND_WHITELIST,
+    TERMINAL_TOOLS_ENABLED,
     WRAP_TEXT,
     SettingsStore,
 )
 from src.personalization_dialog import PersonalizationDialog
 from src.settings_dialog import SettingsDialog
+from src.terminal_tools import ALLOWED_TERMINAL_COMMANDS
 
 
 class AppStartupTests(unittest.TestCase):
@@ -158,6 +162,40 @@ class AppStartupTests(unittest.TestCase):
                     app._set_wrap_text(True)
                     self.assertTrue(app.wrap_text)
                     self.assertEqual(app.preview.cget("wrap"), "word")
+            finally:
+                root.destroy()
+
+    def test_terminal_tools_are_disabled_by_default_and_require_an_open_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            project = root_path / "project"
+            project.mkdir()
+            store = SettingsStore(root_path / "settings.sqlite3")
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", store.database_path),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    self.assertFalse(app.allow_terminal_tools)
+                    self.assertFalse(app.terminal_tools_var.get())
+
+                    app.terminal_tools_var.set(True)
+                    app._set_terminal_tools_enabled()
+                    self.assertFalse(app.terminal_tools_var.get())
+                    self.assertFalse(
+                        store.get_bool(TERMINAL_TOOLS_ENABLED, default=False)
+                    )
+
+                    app._load_project(project)
+                    app.terminal_tools_var.set(True)
+                    app._set_terminal_tools_enabled()
+                    self.assertTrue(app.allow_terminal_tools)
+                    self.assertTrue(
+                        store.get_bool(TERMINAL_TOOLS_ENABLED, default=False)
+                    )
             finally:
                 root.destroy()
 
@@ -585,6 +623,8 @@ class AppStartupTests(unittest.TestCase):
                         app._set_output_logging,
                         app.api_key,
                         app._set_api_key,
+                        app.allowed_terminal_commands,
+                        app._set_terminal_command_whitelist,
                     )
                     dialog.dark_theme.set(True)
                     dialog._save_dark_theme()
@@ -592,6 +632,33 @@ class AppStartupTests(unittest.TestCase):
                     dialog._save_wrap_text()
                     dialog.remove_images_after_send.set(False)
                     dialog._save_remove_images_after_send()
+                    dialog._open_terminal_whitelist()
+                    whitelist = dialog.terminal_whitelist_dialog
+                    self.assertIsNotNone(whitelist)
+                    assert whitelist is not None
+                    whitelist.command_vars["ls"].set(False)
+                    whitelist._save()
+                    self.assertNotIn("ls", app.allowed_terminal_commands)
+                    self.assertEqual(
+                        app.settings.get(TERMINAL_COMMAND_WHITELIST),
+                        json.dumps(
+                            [
+                                command
+                                for command in ALLOWED_TERMINAL_COMMANDS
+                                if command != "ls"
+                            ]
+                        ),
+                    )
+                    dialog._open_terminal_whitelist()
+                    empty_whitelist = dialog.terminal_whitelist_dialog
+                    self.assertIsNotNone(empty_whitelist)
+                    assert empty_whitelist is not None
+                    for command_var in empty_whitelist.command_vars.values():
+                        command_var.set(False)
+                    empty_whitelist._save()
+                    self.assertTrue(empty_whitelist.dialog.winfo_exists())
+                    self.assertIn("at least one", empty_whitelist.status.get())
+                    empty_whitelist.dialog.destroy()
                     self.assertFalse(hasattr(dialog, "output_log_enabled"))
                     self.assertFalse(app.diagnostics_enabled)
                     log_path = root_path / "diagnostics.log"
@@ -721,6 +788,125 @@ class AppStartupTests(unittest.TestCase):
                     self.assertFalse(app.web_var.get())
                     self.assertEqual(app.send_button.cget("text"), "Stop")
                     self.assertEqual(str(app.send_button.cget("state")), "disabled")
+            finally:
+                root.destroy()
+
+    def test_enabled_terminal_tools_add_protocol_only_to_the_api_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            project = root_path / "project"
+            project.mkdir()
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", root_path / "settings.sqlite3"),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.api_key = "test-api-key"
+                    app._load_project(project)
+                    app.allow_terminal_tools = True
+                    app.allowed_terminal_commands = ("python --version",)
+                    app.terminal_tools_var.set(True)
+                    app.message.insert("1.0", "List the project files.")
+                    with patch("src.app.threading.Thread") as thread:
+                        app._send()
+
+                    api_prompt = thread.call_args.kwargs["args"][0]
+                    transcript = app.chat_output.get("1.0", "end")
+                    self.assertIn("deepbrid_tool", api_prompt)
+                    self.assertIn("List the project files.", api_prompt)
+                    self.assertIn("python --version", api_prompt)
+                    self.assertNotIn("git status --short --branch", api_prompt)
+                    self.assertNotIn("deepbrid_tool", transcript)
+                    self.assertTrue(app.chat_tool_mode)
+            finally:
+                root.destroy()
+
+    def test_terminal_command_requires_approval_before_worker_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", root_path / "settings.sqlite3"),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.project_root = root_path
+                    app.active_project_root = root_path
+                    app.active_terminal_commands = ALLOWED_TERMINAL_COMMANDS
+                    app.allow_terminal_tools = True
+                    app.chat_tool_mode = True
+                    app.chat_request_active = True
+                    app.active_chat_options = ("gpt-6.1-sol", None, False)
+                    with (
+                        patch("src.app.messagebox.askyesno", return_value=True) as confirm,
+                        patch("src.app.threading.Thread") as thread,
+                    ):
+                        app._handle_terminal_tool_request("ls")
+
+                    confirmation = confirm.call_args.args[1]
+                    self.assertIn("ls", confirmation)
+                    self.assertIn(str(root_path), confirmation)
+                    thread.assert_called_once()
+                    self.assertEqual(
+                        thread.call_args.kwargs["args"],
+                        ("ls", root_path, ALLOWED_TERMINAL_COMMANDS),
+                    )
+                    self.assertEqual(
+                        thread.call_args.kwargs["target"].__name__,
+                        "_terminal_command_worker",
+                    )
+                    thread.return_value.start.assert_called_once()
+            finally:
+                root.destroy()
+
+    def test_declined_terminal_request_is_not_run_and_assistant_gets_the_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", root_path / "settings.sqlite3"),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.allow_terminal_tools = True
+                    app.chat_tool_mode = True
+                    app.chat_request_active = True
+                    app.active_project_root = root_path
+                    app.active_terminal_commands = ALLOWED_TERMINAL_COMMANDS
+                    app.active_chat_options = ("gpt-6.1-sol", None, False)
+                    app.chat_events.put(
+                        (
+                            "chat-success",
+                            AiChatResponse(
+                                '{"deepbrid_tool":"terminal","command":"ls"}',
+                                "42",
+                            ),
+                        )
+                    )
+                    with (
+                        patch("src.app.messagebox.askyesno", return_value=False) as confirm,
+                        patch("src.app.threading.Thread") as thread,
+                    ):
+                        app._poll_chat_events()
+
+                    confirm.assert_called_once()
+                    self.assertEqual(
+                        thread.call_args.kwargs["target"].__name__,
+                        "_chat_worker",
+                    )
+                    self.assertIn("declined", thread.call_args.kwargs["args"][0])
+                    self.assertNotIn(
+                        '{"deepbrid_tool":"terminal","command":"ls"}',
+                        app.chat_output.get("1.0", "end"),
+                    )
+                    self.assertTrue(app.chat_request_active)
             finally:
                 root.destroy()
 
