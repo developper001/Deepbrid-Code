@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shutil
+import tempfile
 import urllib.parse
 import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterable, Iterator, NoReturn
 
 
 API_BASE = "https://www.deepbrid.com/api/v1/ai"
@@ -45,6 +48,40 @@ class AiConversation:
 @dataclass(frozen=True)
 class AiMessage:
     role: str
+    content: str
+    files: tuple[AiMediaFile, ...] = ()
+    zip_url: str | None = None
+
+
+@dataclass(frozen=True)
+class AiMediaFile:
+    file_id: int
+    kind: str
+    name: str
+    mime: str
+    size: int
+    url: str
+
+
+@dataclass(frozen=True)
+class AiChatResponse:
+    content: str
+    conversation_id: str | None
+    files: tuple[AiMediaFile, ...] = ()
+    zip_url: str | None = None
+    stopped: bool = False
+
+
+@dataclass(frozen=True)
+class AiPrompt:
+    prompt_id: str
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class AiMemory:
+    memory_id: str
     content: str
 
 
@@ -150,8 +187,75 @@ class DeepbridApiClient:
             role = item.get("role")
             content = item.get("content")
             if isinstance(role, str) and isinstance(content, str):
-                messages.append(AiMessage(role, content))
+                messages.append(
+                    AiMessage(
+                        role,
+                        content,
+                        self._parse_media_files(item.get("files")),
+                        self._optional_string(item.get("zip_url")),
+                    )
+                )
         return messages
+
+    def list_prompts(self) -> list[AiPrompt]:
+        result = self._request("GET", "/prompts")
+        raw_items = self._record_list(result, "prompts")
+        prompts: list[AiPrompt] = []
+        for item in raw_items:
+            prompt_id = item.get("id")
+            title = item.get("title")
+            body = item.get("body")
+            if (
+                isinstance(prompt_id, (int, str))
+                and isinstance(title, str)
+                and isinstance(body, str)
+            ):
+                prompts.append(AiPrompt(str(prompt_id), title, body))
+        return prompts
+
+    def list_memories(self) -> list[AiMemory]:
+        result = self._request("GET", "/memories")
+        raw_items = self._record_list(result, "memories")
+        memories: list[AiMemory] = []
+        for item in raw_items:
+            memory_id = item.get("id")
+            content = item.get("content")
+            if isinstance(memory_id, (int, str)) and isinstance(content, str):
+                memories.append(AiMemory(str(memory_id), content))
+        return memories
+
+    def create_prompt(self, title: str, body: str) -> None:
+        self._request("POST", "/prompts", json_body={"title": title, "body": body})
+
+    def update_prompt(self, prompt_id: str, title: str, body: str) -> None:
+        query = urllib.parse.urlencode({"id": prompt_id})
+        self._request(
+            "PATCH",
+            f"/prompts?{query}",
+            json_body={"title": title, "body": body},
+        )
+
+    def delete_prompt(self, prompt_id: str) -> None:
+        query = urllib.parse.urlencode({"id": prompt_id})
+        self._request("DELETE", f"/prompts?{query}")
+
+    def create_memory(self, content: str) -> None:
+        self._request("POST", "/memories", json_body={"content": content})
+
+    def update_memory(self, memory_id: str, content: str) -> None:
+        query = urllib.parse.urlencode({"id": memory_id})
+        self._request(
+            "PATCH",
+            f"/memories?{query}",
+            json_body={"content": content},
+        )
+
+    def delete_memory(self, memory_id: str) -> None:
+        query = urllib.parse.urlencode({"id": memory_id})
+        self._request("DELETE", f"/memories?{query}")
+
+    def delete_all_memories(self) -> None:
+        self._request("DELETE", "/memories?all=1")
 
     def create_conversation(
         self,
@@ -259,6 +363,296 @@ class DeepbridApiClient:
             next_conversation_id = conversation_id
         return content, next_conversation_id
 
+    def chat_stream(
+        self,
+        message: str,
+        *,
+        model: str | None = None,
+        use_web: bool = False,
+        conversation_id: str | None = None,
+        assistant: str | None = None,
+        attachment_paths: list[Path] | None = None,
+        on_event: Callable[[str, object], None],
+    ) -> AiChatResponse:
+        model_id = LEGACY_MODEL_IDS.get(model, model) if model else None
+        file_ids = [self.upload(path) for path in attachment_paths or []]
+
+        if conversation_id is not None:
+            self.update_conversation(
+                conversation_id,
+                model=model_id,
+                assistant=assistant,
+                use_web=use_web,
+            )
+
+        body: dict[str, object] = {"message": message, "stream": True}
+        if conversation_id is None:
+            body["use_web"] = use_web
+            if model_id:
+                body["model"] = model_id
+            if assistant:
+                body["assistant"] = assistant
+        else:
+            body["conversation_id"] = int(conversation_id)
+        if file_ids:
+            body["fichiers"] = file_ids
+
+        request = urllib.request.Request(
+            f"{API_BASE}/chat",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=self._headers("application/json"),
+            method="POST",
+        )
+        content_parts: list[str] = []
+        next_conversation_id = conversation_id
+        response_message: dict[str, object] = {}
+        zip_url: str | None = None
+        stopped = False
+        saw_done = False
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                for event_name, event_data in self._iter_sse_events(response):
+                    try:
+                        payload = json.loads(event_data)
+                    except json.JSONDecodeError as error:
+                        raise DeepbridApiError(
+                            "Deepbrid returned invalid streaming event data."
+                        ) from error
+                    if not isinstance(payload, dict):
+                        raise DeepbridApiError(
+                            "Deepbrid returned an invalid streaming event."
+                        )
+                    on_event(event_name, payload)
+
+                    if event_name == "start":
+                        returned_id = payload.get("conversation_id")
+                        if isinstance(returned_id, (int, str)):
+                            next_conversation_id = str(returned_id)
+                    elif event_name == "error":
+                        code = payload.get("code") or "chat_error"
+                        detail = payload.get("message") or "Deepbrid AI Chat failed."
+                        detail = str(detail).replace(self.api_key, "<redacted>")
+                        code = str(code).replace(self.api_key, "<redacted>")
+                        raise DeepbridApiError(f"{detail} ({code})")
+                    elif event_name == "done":
+                        saw_done = True
+                        stopped = payload.get("stopped") is True
+                        returned_id = payload.get("conversation_id")
+                        if isinstance(returned_id, (int, str)):
+                            next_conversation_id = str(returned_id)
+                        message_value = payload.get("message")
+                        if isinstance(message_value, dict):
+                            response_message = message_value
+                        zip_url = self._optional_string(
+                            response_message.get("zip_url")
+                        )
+                    elif event_name in {"", "message"}:
+                        text = payload.get("t")
+                        if isinstance(text, str):
+                            content_parts.append(text)
+
+        except urllib.error.HTTPError as error:
+            self._raise_http_error(error)
+        except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
+            raise DeepbridApiError(
+                f"Could not reach the Deepbrid AI API: {error}"
+            ) from error
+
+        if not saw_done:
+            raise DeepbridApiError("Deepbrid's streaming response ended unexpectedly.")
+        final_content = response_message.get("content")
+        if isinstance(final_content, str) and not content_parts:
+            content_parts.append(final_content)
+        return AiChatResponse(
+            content="".join(content_parts),
+            conversation_id=next_conversation_id,
+            files=self._parse_media_files(response_message.get("files")),
+            zip_url=zip_url,
+            stopped=stopped,
+        )
+
+    def stop(self, conversation_id: str) -> None:
+        self._request(
+            "POST",
+            "/stop",
+            json_body={"conversation_id": int(conversation_id)},
+        )
+
+    def download_media(
+        self,
+        media_url: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        endpoint = self._media_endpoint(media_url)
+        request = urllib.request.Request(
+            f"{API_BASE}{endpoint}",
+            headers=self._headers("application/octet-stream", accept="*/*"),
+            method="GET",
+        )
+        chunks: list[bytes] = []
+        total_size = 0
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                while chunk := response.read(64 * 1024):
+                    total_size += len(chunk)
+                    if max_bytes is not None and total_size > max_bytes:
+                        raise DeepbridApiError(
+                            "The downloaded media exceeds the preview size limit."
+                        )
+                    chunks.append(chunk)
+        except urllib.error.HTTPError as error:
+            self._raise_http_error(error)
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise DeepbridApiError(
+                f"Could not download the Deepbrid media: {error}"
+            ) from error
+        return b"".join(chunks)
+
+    def download_media_to(self, media_url: str, destination: Path) -> None:
+        endpoint = self._media_endpoint(media_url)
+        request = urllib.request.Request(
+            f"{API_BASE}{endpoint}",
+            headers=self._headers("application/octet-stream", accept="*/*"),
+            method="GET",
+        )
+        temporary_path: Path | None = None
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                with tempfile.NamedTemporaryFile(
+                    dir=destination.parent,
+                    prefix=".deepbrid-",
+                    suffix=".part",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    shutil.copyfileobj(response, temporary_file)
+            temporary_path.replace(destination)
+            temporary_path = None
+        except urllib.error.HTTPError as error:
+            self._raise_http_error(error)
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise DeepbridApiError(
+                f"Could not download the Deepbrid media: {error}"
+            ) from error
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _media_endpoint(media_url: str) -> str:
+        parsed = urllib.parse.urlsplit(media_url)
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.path != "/api/v1/ai/media"
+            or not parsed.query
+        ):
+            raise DeepbridApiError("Deepbrid returned an invalid media URL.")
+        return f"/media?{parsed.query}"
+
+    @staticmethod
+    def _record_list(result: object, key: str) -> list[dict[str, object]]:
+        if not isinstance(result, dict):
+            raise DeepbridApiError(f"Deepbrid returned an invalid {key} response.")
+        raw_items = result.get(key)
+        if not isinstance(raw_items, list):
+            raise DeepbridApiError(f"Deepbrid returned an invalid {key} list.")
+        return [item for item in raw_items if isinstance(item, dict)]
+
+    @staticmethod
+    def _optional_string(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _parse_media_files(raw_files: object) -> tuple[AiMediaFile, ...]:
+        if raw_files is None:
+            return ()
+        if not isinstance(raw_files, list):
+            raise DeepbridApiError("Deepbrid returned invalid media file data.")
+        files: list[AiMediaFile] = []
+        for item in raw_files:
+            if not isinstance(item, dict):
+                raise DeepbridApiError("Deepbrid returned an invalid media file.")
+            file_id = item.get("id")
+            name = item.get("name") or item.get("nom")
+            kind = item.get("kind") or ""
+            mime = item.get("mime") or ""
+            size = item.get("size") or item.get("taille") or 0
+            url = item.get("url")
+            if (
+                isinstance(file_id, int)
+                and isinstance(name, str)
+                and isinstance(kind, str)
+                and isinstance(mime, str)
+                and isinstance(size, int)
+                and isinstance(url, str)
+            ):
+                files.append(AiMediaFile(file_id, kind, name, mime, size, url))
+            else:
+                raise DeepbridApiError("Deepbrid returned an invalid media file.")
+        return tuple(files)
+
+    @staticmethod
+    def _iter_sse_events(response: Iterable[bytes]) -> Iterator[tuple[str, str]]:
+        event_name = ""
+        data_lines: list[str] = []
+        for raw_line in response:
+            line = raw_line.decode("utf-8").rstrip("\r\n")
+            if not line:
+                if data_lines:
+                    yield event_name, "\n".join(data_lines)
+                event_name = ""
+                data_lines = []
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if data_lines:
+            yield event_name, "\n".join(data_lines)
+
+    def _headers(
+        self,
+        content_type: str,
+        *,
+        accept: str = "application/json",
+    ) -> dict[str, str]:
+        if not self.api_key:
+            raise DeepbridApiError("Deepbrid API key is missing.")
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": accept,
+            "Content-Type": content_type,
+            "User-Agent": "DeepbridCode/1.0",
+        }
+
+    def _raise_http_error(self, error: urllib.error.HTTPError) -> NoReturn:
+        status = error.code
+        payload = error.read().decode("utf-8", errors="replace")
+        error.close()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            data = {}
+        code = data.get("code") if isinstance(data, dict) else None
+        detail = data.get("message") if isinstance(data, dict) else payload
+        detail = str(detail or "No response details").replace(
+            self.api_key,
+            "<redacted>",
+        )
+        if code is not None:
+            code = str(code).replace(self.api_key, "<redacted>")
+        raise DeepbridApiError(
+            f"Deepbrid AI API returned HTTP {status}"
+            f"{f' ({code})' if code else ''}: {detail or 'No response details'}"
+        ) from error
+
     def upload(self, path: Path) -> int:
         if not path.is_file():
             raise DeepbridApiError(f"Attachment does not exist: {path}")
@@ -310,12 +704,7 @@ class DeepbridApiClient:
         request = urllib.request.Request(
             f"{API_BASE}{endpoint}",
             data=body,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/json",
-                "Content-Type": content_type,
-                "User-Agent": "DeepbridCode/1.0",
-            },
+            headers=self._headers(content_type),
             method=method,
         )
         try:
@@ -323,25 +712,7 @@ class DeepbridApiClient:
                 status = response.status
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
-            status = error.code
-            payload = error.read().decode("utf-8", errors="replace")
-            error.close()
-            try:
-                data = json.loads(payload)
-            except json.JSONDecodeError:
-                data = {}
-            code = data.get("code") if isinstance(data, dict) else None
-            if code is not None:
-                code = str(code).replace(self.api_key, "<redacted>")
-            detail = data.get("message") if isinstance(data, dict) else payload
-            detail = str(detail or "No response details").replace(
-                self.api_key,
-                "<redacted>",
-            )
-            raise DeepbridApiError(
-                f"Deepbrid AI API returned HTTP {status}"
-                f"{f' ({code})' if code else ''}: {detail or 'No response details'}"
-            ) from error
+            self._raise_http_error(error)
         except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
             raise DeepbridApiError(f"Could not reach the Deepbrid AI API: {error}") from error
 

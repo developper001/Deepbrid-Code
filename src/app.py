@@ -9,6 +9,7 @@ import tkinter as tk
 import traceback
 from collections import deque
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from types import TracebackType
@@ -17,7 +18,9 @@ from PIL import Image, ImageGrab, ImageTk
 
 from .ai_api import (
     AiAssistant,
+    AiChatResponse,
     AiConversation,
+    AiMediaFile,
     AiMessage,
     AiModel,
     DeepbridApiClient,
@@ -34,6 +37,7 @@ from .context import (
     upload_context_kind,
 )
 from .logo import create_brand_icon
+from .personalization_dialog import PersonalizationDialog
 from .settings import (
     API_KEY,
     DARK_THEME,
@@ -112,7 +116,7 @@ class DeepbridCodeApp:
         self.cleanup_clipboard_after_chat = False
         self.pending_image_context_keys: list[str] = []
         self.pending_remove_images_after_send = True
-        self.chat_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.chat_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.sessions_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.api_options_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.sessions_window: tk.Toplevel | None = None
@@ -122,6 +126,7 @@ class DeepbridCodeApp:
         self.sessions: list[AiConversation] = []
         self.session_rows: dict[str, AiConversation] = {}
         self.sessions_request_active = False
+        self.personalization_dialog: PersonalizationDialog | None = None
         self.ai_model = FALLBACK_MODELS[0].label
         self.ai_assistant = ""
         self.web_enabled = False
@@ -136,6 +141,9 @@ class DeepbridCodeApp:
         self._startup_after_id: str | None = None
         self._initial_sash_set = False
         self.chat_request_active = False
+        self.chat_answer_started = False
+        self.chat_stop_requested = False
+        self.media_preview_images: list[ImageTk.PhotoImage] = []
 
         self._build_ui()
         self._apply_theme()
@@ -174,6 +182,11 @@ class DeepbridCodeApp:
             side="left",
             padx=(8, 0),
         )
+        ttk.Button(
+            toolbar,
+            text="Prompts & Memory",
+            command=self._open_personalization,
+        ).pack(side="left", padx=(8, 0))
         ttk.Label(toolbar, text="Assistant").pack(side="left", padx=(16, 4))
         self.assistant_selector = ttk.Combobox(
             toolbar,
@@ -770,6 +783,30 @@ class DeepbridCodeApp:
         if self.sessions_window is not None:
             self.sessions_window.destroy()
 
+    def _open_personalization(self) -> None:
+        if not self.api_key:
+            self.status.set("Add your Deepbrid Premium API key to manage prompts and memories.")
+            return
+        if self.personalization_dialog is not None:
+            try:
+                if self.personalization_dialog.window.winfo_exists():
+                    self.personalization_dialog.window.lift()
+                    return
+            except tk.TclError:
+                pass
+        self.personalization_dialog = PersonalizationDialog(
+            self.root,
+            self.api_key,
+            self._insert_saved_prompt,
+            self.theme_colors,
+        )
+
+    def _insert_saved_prompt(self, prompt: str) -> None:
+        if self.message.get("1.0", "end-1c"):
+            self.message.insert("insert", "\n")
+        self.message.insert("insert", prompt)
+        self.message.focus_set()
+
     def _filter_sessions(self, *_args: object) -> None:
         tree = self.sessions_tree
         if tree is None:
@@ -922,6 +959,8 @@ class DeepbridCodeApp:
                         self._append_chat(
                             "You" if message.role == "user" else "Deepbrid AI",
                             message.content,
+                            message.files,
+                            message.zip_url,
                         )
                     self.status.set(
                         "Started a new conversation."
@@ -1670,7 +1709,7 @@ class DeepbridCodeApp:
 
     def _send(self) -> None:
         if self.chat_request_active:
-            self.status.set("Wait for the current Deepbrid AI Chat response to finish.")
+            self._stop_chat()
             return
         if not self.api_key:
             self.status.set("Add your Deepbrid Premium API key in Settings before sending.")
@@ -1708,6 +1747,13 @@ class DeepbridCodeApp:
         self.ai_model = self.model_selector.get()
         self.web_enabled = web_enabled
         self.chat_request_active = True
+        self.chat_stop_requested = False
+        self.chat_answer_started = False
+        self.send_button.configure(
+            text="Stop",
+            command=self._stop_chat,
+            state="normal" if self.api_conversation_id else "disabled",
+        )
         self._log(
             f"Sending prompt with {len(self.context_files)} context item(s) "
             f"and {len(attachment_paths)} attachment(s), model {selected_model}, "
@@ -1737,9 +1783,8 @@ class DeepbridCodeApp:
         try:
             worker.start()
         except RuntimeError as error:
-            self.chat_request_active = False
+            self._set_chat_idle()
             self.pending_image_context_keys = []
-            self._stop_progress()
             self.status.set(f"Could not start the chat request: {error}")
 
     def _chat_worker(
@@ -1751,16 +1796,36 @@ class DeepbridCodeApp:
         web_enabled: bool,
     ) -> None:
         try:
-            response, conversation_id = DeepbridApiClient(self.api_key).chat(
+            def on_stream_event(event_name: str, payload: object) -> None:
+                if not isinstance(payload, dict):
+                    return
+                if event_name == "start":
+                    conversation_id = payload.get("conversation_id")
+                    if isinstance(conversation_id, (int, str)):
+                        self.chat_events.put(("chat-start", str(conversation_id)))
+                        self.chat_events.put(("chat-submitted", None))
+                elif not event_name:
+                    text = payload.get("t")
+                    if isinstance(text, str):
+                        self.chat_events.put(("chat-delta", text))
+                elif event_name == "status":
+                    stage = payload.get("stage")
+                    if isinstance(stage, str):
+                        self.chat_events.put(("chat-stage", stage))
+                elif event_name == "notice":
+                    notice = payload.get("message")
+                    if isinstance(notice, str):
+                        self.chat_events.put(("chat-notice", notice))
+
+            response = DeepbridApiClient(self.api_key).chat_stream(
                 prompt,
                 model=model,
                 use_web=web_enabled,
                 conversation_id=self.api_conversation_id,
                 assistant=assistant,
                 attachment_paths=attachment_paths,
+                on_event=on_stream_event,
             )
-            self.api_conversation_id = conversation_id
-            self.chat_events.put(("chat-submitted", ""))
         except DeepbridApiError as error:
             self._log(f"Deepbrid AI API request failed: {error}")
             self.chat_events.put(("chat-error", str(error)))
@@ -1773,23 +1838,145 @@ class DeepbridCodeApp:
             if self.cleanup_clipboard_after_chat:
                 self._cleanup_clipboard_images()
 
+    def _stop_chat(self) -> None:
+        if not self.chat_request_active or self.chat_stop_requested:
+            return
+        conversation_id = self.api_conversation_id
+        if conversation_id is None:
+            self.status.set("Waiting for Deepbrid to start the response before stopping.")
+            return
+        self.chat_stop_requested = True
+        self.send_button.configure(state="disabled")
+        self.status.set("Asking Deepbrid to stop the response...")
+        worker = threading.Thread(
+            target=self._stop_chat_worker,
+            args=(conversation_id,),
+            name="deepbrid-chat-stop",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self.chat_stop_requested = False
+            self.send_button.configure(state="normal")
+            self.status.set(f"Could not start the stop request: {error}")
+
+    def _stop_chat_worker(self, conversation_id: str) -> None:
+        try:
+            DeepbridApiClient(self.api_key).stop(conversation_id)
+        except (DeepbridApiError, OSError, RuntimeError) as error:
+            self.chat_events.put(("chat-stop-error", str(error)))
+        else:
+            self.chat_events.put(("chat-stop-success", conversation_id))
+
+    def _set_chat_idle(self) -> None:
+        self.chat_request_active = False
+        self.chat_stop_requested = False
+        self.send_button.configure(
+            text="Send",
+            command=self._send,
+            state="normal",
+        )
+        self._stop_progress()
+
+    def _append_stream_chunk(self, chunk: str) -> None:
+        self.chat_output.configure(state="normal")
+        if not self.chat_answer_started:
+            self.chat_output.insert("end", "Deepbrid AI:\n")
+            self.chat_answer_started = True
+        self.chat_output.insert("end", chunk)
+        self.chat_output.see("end")
+        self.chat_output.configure(state="disabled")
+
     def _poll_chat_events(self) -> None:
         self._poll_after_id = None
         while True:
             try:
-                event, content = self.chat_events.get_nowait()
+                event, payload = self.chat_events.get_nowait()
             except queue.Empty:
                 break
             if event in {"chat-success", "chat-error"}:
-                self.chat_request_active = False
-                self._stop_progress()
-            if event == "chat-success":
-                self._log(f"Deepbrid AI Chat returned {len(content)} characters.")
-                self._append_chat("Deepbrid AI", content)
-                self.status.set(f"Deepbrid AI Chat replied ({len(content)} characters).")
+                self._set_chat_idle()
+            if event == "chat-start":
+                if isinstance(payload, str):
+                    self.api_conversation_id = payload
+                    self.send_button.configure(state="normal")
+            elif event == "chat-delta":
+                if isinstance(payload, str):
+                    self._append_stream_chunk(payload)
+            elif event == "chat-stage":
+                if isinstance(payload, str):
+                    self.status.set(f"Deepbrid: {payload}")
+            elif event == "chat-notice":
+                if isinstance(payload, str):
+                    self.status.set(payload)
+            elif event == "chat-success":
+                if isinstance(payload, AiChatResponse):
+                    if payload.conversation_id is not None:
+                        self.api_conversation_id = payload.conversation_id
+                    if self.chat_answer_started:
+                        self.chat_output.configure(state="normal")
+                        self.chat_output.insert("end", "\n\n")
+                        self._insert_media_controls(payload.files, payload.zip_url)
+                        self.chat_output.see("end")
+                        self.chat_output.configure(state="disabled")
+                        self.chat_answer_started = False
+                    else:
+                        content = payload.content
+                        if not content and payload.files:
+                            content = "Generated files:"
+                        self._append_chat(
+                            "Deepbrid AI",
+                            content,
+                            payload.files,
+                            payload.zip_url,
+                        )
+                    self._log(
+                        f"Deepbrid AI Chat returned {len(payload.content)} characters "
+                        f"and {len(payload.files)} file(s)."
+                    )
+                    self.status.set(
+                        "Deepbrid stopped the response."
+                        if payload.stopped
+                        else "Deepbrid AI Chat replied."
+                    )
+                else:
+                    self._append_chat(
+                        "Deepbrid AI Chat status",
+                        "Deepbrid returned an invalid streaming response.",
+                    )
+                    self.status.set("Deepbrid returned an invalid streaming response.")
             elif event == "chat-error":
-                self._append_chat("Deepbrid AI Chat status", content)
-                self.status.set(content)
+                if self.chat_answer_started:
+                    self.chat_output.configure(state="normal")
+                    self.chat_output.insert("end", "\n\n")
+                    self.chat_output.configure(state="disabled")
+                    self.chat_answer_started = False
+                error = str(payload)
+                self._append_chat("Deepbrid AI Chat status", error)
+                self.status.set(error)
+            elif event == "chat-stop-success":
+                if self.chat_request_active:
+                    self.status.set("Deepbrid accepted the stop request.")
+            elif event == "chat-stop-error":
+                self.chat_stop_requested = False
+                if self.chat_request_active:
+                    self.send_button.configure(state="normal")
+                error = str(payload)
+                self._log(f"Could not stop Deepbrid AI Chat: {error}")
+                self.status.set(f"Could not stop the response: {error}")
+            elif event == "media-download-success":
+                if isinstance(payload, dict):
+                    saved_path = payload.get("path")
+                    data = payload.get("data")
+                    if isinstance(saved_path, str):
+                        self.status.set(f"Saved Deepbrid file to {saved_path}")
+                    elif isinstance(data, bytes):
+                        self._show_generated_image(data)
+            elif event == "media-download-error":
+                error = str(payload)
+                self._log(f"Could not download Deepbrid media: {error}")
+                self.status.set(error)
             elif event == "chat-submitted":
                 if self.pending_remove_images_after_send:
                     self._remove_context_keys(self.pending_image_context_keys)
@@ -1813,7 +2000,13 @@ class DeepbridCodeApp:
         if self.root.report_callback_exception == self._report_callback_exception:
             self.root.report_callback_exception = self._previous_callback_exception
 
-    def _append_chat(self, speaker: str, content: str) -> None:
+    def _append_chat(
+        self,
+        speaker: str,
+        content: str,
+        files: tuple[AiMediaFile, ...] = (),
+        zip_url: str | None = None,
+    ) -> None:
         self.chat_output.configure(state="normal")
         if speaker == "You":
             timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -1823,8 +2016,133 @@ class DeepbridCodeApp:
                 "turn-separator",
             )
         self.chat_output.insert("end", f"{speaker}:\n{content}\n\n")
+        self._insert_media_controls(files, zip_url)
         self.chat_output.see("end")
         self.chat_output.configure(state="disabled")
+
+    def _insert_media_controls(
+        self,
+        files: tuple[AiMediaFile, ...],
+        zip_url: str | None,
+    ) -> None:
+        if not files and not zip_url:
+            return
+        self.chat_output.insert("end", "Files: ")
+        for media in files:
+            safe_name = Path(media.name).name or "deepbrid-file"
+            save_button = ttk.Button(
+                self.chat_output,
+                text=f"Save {safe_name}",
+                command=lambda item=media, name=safe_name: self._save_ai_media(
+                    item.url,
+                    name,
+                ),
+            )
+            self.chat_output.window_create("end", window=save_button, padx=3)
+            if (
+                media.mime.casefold().startswith("image/")
+                or media.kind.casefold() in {"image", "generated"}
+            ):
+                preview_button = ttk.Button(
+                    self.chat_output,
+                    text="Preview",
+                    command=lambda item=media: self._preview_ai_media(item),
+                )
+                self.chat_output.window_create("end", window=preview_button, padx=3)
+            self.chat_output.insert("end", " ")
+        if zip_url:
+            zip_button = ttk.Button(
+                self.chat_output,
+                text="Save answer files (.zip)",
+                command=lambda url=zip_url: self._save_ai_media(
+                    url,
+                    "deepbrid-answer.zip",
+                ),
+            )
+            self.chat_output.window_create("end", window=zip_button, padx=3)
+        self.chat_output.insert("end", "\n")
+
+    def _save_ai_media(self, media_url: str, filename: str) -> None:
+        suffix = Path(filename).suffix
+        selected = filedialog.asksaveasfilename(
+            title="Save Deepbrid file",
+            initialfile=filename,
+            defaultextension=suffix,
+            filetypes=(("All files", "*.*"),),
+        )
+        if selected:
+            self._start_media_download(media_url, Path(selected), preview=False)
+
+    def _preview_ai_media(self, media: AiMediaFile) -> None:
+        if media.size > MAX_IMAGE_PREVIEW_BYTES:
+            self.status.set(
+                "This generated image is too large to preview; save it instead."
+            )
+            return
+        self._start_media_download(media.url, None, preview=True)
+
+    def _start_media_download(
+        self,
+        media_url: str,
+        destination: Path | None,
+        *,
+        preview: bool,
+    ) -> None:
+        worker = threading.Thread(
+            target=self._media_download_worker,
+            args=(media_url, destination, preview),
+            name="deepbrid-media-download",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self.status.set(f"Could not start media download: {error}")
+
+    def _media_download_worker(
+        self,
+        media_url: str,
+        destination: Path | None,
+        preview: bool,
+    ) -> None:
+        try:
+            client = DeepbridApiClient(self.api_key)
+            if preview:
+                data = client.download_media(
+                    media_url,
+                    max_bytes=MAX_IMAGE_PREVIEW_BYTES,
+                )
+                self.chat_events.put(("media-download-success", {"data": data}))
+            elif destination is not None:
+                client.download_media_to(media_url, destination)
+                self.chat_events.put(
+                    ("media-download-success", {"path": str(destination)})
+                )
+            else:
+                raise ValueError("A destination is required to save this file.")
+        except (DeepbridApiError, OSError, RuntimeError, ValueError) as error:
+            self.chat_events.put(("media-download-error", str(error)))
+
+    def _show_generated_image(self, data: bytes) -> None:
+        try:
+            with Image.open(BytesIO(data)) as image:
+                image.thumbnail((900, 700))
+                photo = ImageTk.PhotoImage(image.copy(), master=self.root)
+        except (OSError, ValueError) as error:
+            self.status.set(f"Could not preview generated image: {error}")
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Generated image")
+        window.transient(self.root)
+        label = ttk.Label(window, image=photo)
+        label.pack(fill="both", expand=True, padx=8, pady=8)
+        self.media_preview_images.append(photo)
+
+        def release_image(_event: tk.Event) -> None:
+            if photo in self.media_preview_images:
+                self.media_preview_images.remove(photo)
+
+        window.bind("<Destroy>", release_image, add="+")
 
     def _close(self) -> None:
         self._log("Deepbrid Code is closing.")

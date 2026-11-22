@@ -30,9 +30,13 @@ Bearer authentication and are sent directly to Deepbrid.
 Models and assistants are loaded from the API. Choose an assistant, model, and
 optional **Web** search before sending. Selected documents and images are
 uploaded through the official AI upload endpoint and attached to the message.
-Conversations are saved to the Deepbrid account; use **Conversations** to list,
-search, open, or start chats. Messages and conversation history are not stored
-in the local project.
+Responses stream into the chat; choose **Stop** to stop a response. Generated
+images and files appear with save controls, and generated images can be
+previewed. Conversations are saved to the Deepbrid account; use
+**Conversations** to list, search, open, or start chats. Use **Prompts &
+Memory** to manage saved prompts and memories, or insert a saved prompt into
+your message. Messages, generated files, prompts, and memories are stored in
+your Deepbrid account, not in the local project.
 
 If the key is missing or rejected, add or correct it in **Settings**. API
 features require Premium and remain subject to Deepbrid's daily and rate limits.

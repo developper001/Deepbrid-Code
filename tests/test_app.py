@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from src.ai_api import AiConversation
+from src.ai_api import AiChatResponse, AiConversation, AiMediaFile, AiPrompt
 from src.app import DeepbridCodeApp
 from src.context import build_prompt
 from src.settings import (
@@ -23,6 +23,7 @@ from src.settings import (
     WRAP_TEXT,
     SettingsStore,
 )
+from src.personalization_dialog import PersonalizationDialog
 from src.settings_dialog import SettingsDialog
 
 
@@ -718,6 +719,109 @@ class AppStartupTests(unittest.TestCase):
                     self.assertEqual(app.model_selector.get(), "GPT-6.1 Sol · Best")
                     self.assertEqual(app.assistant_selector.get(), "Default")
                     self.assertFalse(app.web_var.get())
+                    self.assertEqual(app.send_button.cget("text"), "Stop")
+                    self.assertEqual(str(app.send_button.cget("state")), "disabled")
+            finally:
+                root.destroy()
+
+    def test_streamed_response_displays_generated_media_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", root_path / "settings.sqlite3"),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.chat_request_active = True
+                    app.chat_events.put(("chat-start", "42"))
+                    app.chat_events.put(("chat-delta", "A generated scene"))
+                    app.chat_events.put(
+                        (
+                            "chat-success",
+                            AiChatResponse(
+                                "A generated scene",
+                                "42",
+                                (
+                                    AiMediaFile(
+                                        93,
+                                        "generated",
+                                        "scene.png",
+                                        "",
+                                        1200,
+                                        "/api/v1/ai/media?id=93",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    app._poll_chat_events()
+
+                    output = app.chat_output.get("1.0", "end")
+                    self.assertIn("A generated scene", output)
+                    self.assertEqual(app.api_conversation_id, "42")
+                    self.assertEqual(len(app.chat_output.window_names()), 2)
+                    self.assertFalse(app.chat_request_active)
+            finally:
+                root.destroy()
+
+    def test_personalization_dialog_builds_prompt_and_memory_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = tk.Tk()
+            root.withdraw()
+            inserted: list[str] = []
+            try:
+                with (
+                    patch("src.personalization_dialog.threading.Thread"),
+                    patch("src.personalization_dialog.DeepbridApiClient") as client_type,
+                ):
+                    dialog = PersonalizationDialog(
+                        root,
+                        "test-api-key",
+                        inserted.append,
+                        {
+                            "background": "#202522",
+                            "field": "#171c19",
+                            "foreground": "#e8eee9",
+                            "selection": "#2e426e",
+                        },
+                    )
+                    client = client_type.return_value
+                    client.list_prompts.return_value = [
+                        AiPrompt("3", "Review", "Review this code")
+                    ]
+                    dialog._request_worker(
+                        "prompts",
+                        "create",
+                        None,
+                        {"title": "Review", "body": "Review this code"},
+                    )
+                    dialog._poll_events()
+                    client.create_prompt.assert_called_once_with(
+                        "Review",
+                        "Review this code",
+                    )
+
+                self.assertEqual(len(dialog.trees), 2)
+                self.assertEqual(len(dialog.editors), 2)
+                self.assertEqual(
+                    dialog.editors["prompts"].cget("background"),
+                    "#171c19",
+                )
+                self.assertEqual(len(dialog.buttons["prompts"]), 4)
+                self.assertEqual(len(dialog.buttons["memories"]), 4)
+                self.assertIn("3", dialog.records["prompts"])
+                dialog.records["prompts"]["3"] = AiPrompt(
+                    "3",
+                    "Review",
+                    "Review this code",
+                )
+                dialog.selected_ids["prompts"] = "3"
+                dialog._insert_selected_prompt()
+                self.assertEqual(inserted, ["Review this code"])
+                dialog._close()
             finally:
                 root.destroy()
 
