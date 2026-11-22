@@ -45,8 +45,11 @@ from .settings import (
     LAST_PROJECT,
     OUTPUT_LOG_PATH,
     REMOVE_IMAGES_AFTER_SEND,
+    SELECTED_ASSISTANT,
+    SELECTED_MODEL,
     TERMINAL_COMMAND_WHITELIST,
     TERMINAL_TOOLS_ENABLED,
+    WEB_SEARCH_ENABLED,
     WRAP_TEXT,
     SettingsStore,
 )
@@ -106,6 +109,7 @@ class DeepbridCodeApp:
             TERMINAL_TOOLS_ENABLED,
             default=False,
         )
+        self.web_enabled = self.settings.get_bool(WEB_SEARCH_ENABLED, default=False)
         saved_terminal_whitelist = self.settings.get(TERMINAL_COMMAND_WHITELIST)
         self.terminal_command_whitelist = load_terminal_command_whitelist(
             saved_terminal_whitelist
@@ -122,6 +126,8 @@ class DeepbridCodeApp:
         self.api_conversation_id: str | None = None
         self.api_models = list(FALLBACK_MODELS)
         self.api_assistants: list[AiAssistant] = []
+        self.preferred_model_id = self.settings.get(SELECTED_MODEL)
+        self.preferred_assistant_id = self.settings.get(SELECTED_ASSISTANT) or ""
         self.project_root: Path | None = None
         self.tree_paths: dict[str, Path] = {}
         self.tree_directories: dict[str, Path] = {}
@@ -150,9 +156,16 @@ class DeepbridCodeApp:
         self.session_rows: dict[str, AiConversation] = {}
         self.sessions_request_active = False
         self.personalization_dialog: PersonalizationDialog | None = None
-        self.ai_model = FALLBACK_MODELS[0].label
+        preferred_model = next(
+            (
+                model
+                for model in FALLBACK_MODELS
+                if model.model_id == self.preferred_model_id
+            ),
+            FALLBACK_MODELS[0],
+        )
+        self.ai_model = preferred_model.label
         self.ai_assistant = ""
-        self.web_enabled = False
         self.console_events: queue.Queue[str] = queue.Queue()
         self.console_history: deque[str] = deque(maxlen=2000)
         self.console_output: tk.Text | None = None
@@ -240,9 +253,9 @@ class DeepbridCodeApp:
             variable=self.terminal_tools_var,
             command=self._set_terminal_tools_enabled,
             style=(
-                "SafeCommandsOn.TCheckbutton"
+                "ToggleOn.TCheckbutton"
                 if self.allow_terminal_tools
-                else "SafeCommandsOff.TCheckbutton"
+                else "ToggleOff.TCheckbutton"
             ),
         )
         self.terminal_tools_button.pack(side="left", padx=(12, 0))
@@ -379,13 +392,17 @@ class DeepbridCodeApp:
         self.model_selector.set(self.ai_model)
         self.model_selector.pack(side="left", padx=(12, 0), pady=(4, 0))
         self.model_selector.bind("<<ComboboxSelected>>", self._model_changed)
-        self.web_var = tk.BooleanVar(master=self.root, value=False)
+        self.web_var = tk.BooleanVar(master=self.root, value=self.web_enabled)
         self.web_button = ttk.Checkbutton(
             actions,
-            text="Web",
+            text=f"Web: {'ON' if self.web_enabled else 'OFF'}",
             variable=self.web_var,
             command=self._web_changed,
-            style="Toolbutton",
+            style=(
+                "ToggleOn.TCheckbutton"
+                if self.web_enabled
+                else "ToggleOff.TCheckbutton"
+            ),
         )
         self.web_button.pack(side="left", padx=(8, 0), pady=(4, 0))
         self.send_button = ttk.Button(actions, text="Send", command=self._send)
@@ -458,9 +475,9 @@ class DeepbridCodeApp:
         self.terminal_tools_button.configure(
             text=f"Allow safe commands: {'ON' if enabled else 'OFF'}",
             style=(
-                "SafeCommandsOn.TCheckbutton"
+                "ToggleOn.TCheckbutton"
                 if enabled
-                else "SafeCommandsOff.TCheckbutton"
+                else "ToggleOff.TCheckbutton"
             ),
         )
 
@@ -635,6 +652,7 @@ class DeepbridCodeApp:
         else:
             self.api_models = []
             self.api_assistants = []
+            self.ai_assistant = ""
             self.model_selector.configure(values=())
             self.assistant_selector.configure(values=("Default",))
             self.model_selector.set("")
@@ -661,7 +679,7 @@ class DeepbridCodeApp:
 
     def _assistant_changed(self, _event: tk.Event) -> None:
         selected = self.assistant_selector.get()
-        self.ai_assistant = next(
+        assistant_id = next(
             (
                 assistant.assistant_id
                 for assistant in self.api_assistants
@@ -669,9 +687,44 @@ class DeepbridCodeApp:
             ),
             "",
         )
+        try:
+            self.settings.set(SELECTED_ASSISTANT, assistant_id)
+        except sqlite3.Error as error:
+            self.assistant_selector.set(
+                next(
+                    (
+                        assistant.label
+                        for assistant in self.api_assistants
+                        if assistant.assistant_id == self.ai_assistant
+                    ),
+                    "Default",
+                )
+            )
+            self.status.set(f"Could not save assistant preference: {error}")
+            self._log(f"Could not save assistant preference: {error}")
+            return
+        self.ai_assistant = assistant_id
+        self.preferred_assistant_id = assistant_id
 
     def _model_changed(self, _event: tk.Event) -> None:
-        self.ai_model = self.model_selector.get()
+        selected = self.model_selector.get()
+        model = next(
+            (model for model in self.api_models if model.label == selected),
+            None,
+        )
+        if model is None:
+            self.model_selector.set(self.ai_model)
+            self.status.set("Could not save model preference: model is unavailable.")
+            return
+        try:
+            self.settings.set(SELECTED_MODEL, model.model_id)
+        except sqlite3.Error as error:
+            self.model_selector.set(self.ai_model)
+            self.status.set(f"Could not save model preference: {error}")
+            self._log(f"Could not save model preference: {error}")
+            return
+        self.ai_model = selected
+        self.preferred_model_id = model.model_id
 
     def _selected_model_id(self) -> str | None:
         return next(
@@ -680,7 +733,27 @@ class DeepbridCodeApp:
         )
 
     def _web_changed(self) -> None:
-        self.web_enabled = self.web_var.get()
+        enabled = self.web_var.get()
+        try:
+            self.settings.set_bool(WEB_SEARCH_ENABLED, enabled)
+        except sqlite3.Error as error:
+            self.web_var.set(self.web_enabled)
+            self._update_web_button()
+            self.status.set(f"Could not save Web preference: {error}")
+            self._log(f"Could not save Web preference: {error}")
+            return
+        self.web_enabled = enabled
+        self._update_web_button()
+
+    def _update_web_button(self) -> None:
+        self.web_button.configure(
+            text=f"Web: {'ON' if self.web_enabled else 'OFF'}",
+            style=(
+                "ToggleOn.TCheckbutton"
+                if self.web_enabled
+                else "ToggleOff.TCheckbutton"
+            ),
+        )
 
     def _load_api_options(self) -> None:
         if not self.api_key:
@@ -741,7 +814,17 @@ class DeepbridCodeApp:
                 continue
             self.api_models, self.api_assistants = payload[1], payload[2]
             model_labels = [model.label for model in self.api_models]
-            if self.ai_model not in model_labels:
+            preferred_model = next(
+                (
+                    model
+                    for model in self.api_models
+                    if model.model_id == self.preferred_model_id
+                ),
+                None,
+            )
+            if preferred_model is not None:
+                self.ai_model = preferred_model.label
+            elif self.ai_model not in model_labels:
                 self.ai_model = model_labels[0]
             self.model_selector.configure(values=model_labels)
             self.model_selector.set(self.ai_model)
@@ -754,7 +837,7 @@ class DeepbridCodeApp:
                 (
                     assistant
                     for assistant in self.api_assistants
-                    if assistant.assistant_id == self.ai_assistant
+                    if assistant.assistant_id == self.preferred_assistant_id
                 ),
                 None,
             )
@@ -1306,25 +1389,25 @@ class DeepbridCodeApp:
             foreground=[("disabled", colors["disabled_foreground"])],
         )
         style.configure(
-            "SafeCommandsOn.TCheckbutton",
+            "ToggleOn.TCheckbutton",
             background=colors["safe_on"],
             foreground=colors["safe_toggle_foreground"],
             padding=(10, 5),
             relief="raised",
         )
         style.map(
-            "SafeCommandsOn.TCheckbutton",
+            "ToggleOn.TCheckbutton",
             background=[("active", colors["safe_on_active"])],
         )
         style.configure(
-            "SafeCommandsOff.TCheckbutton",
+            "ToggleOff.TCheckbutton",
             background=colors["safe_off"],
             foreground=colors["safe_toggle_foreground"],
             padding=(10, 5),
             relief="raised",
         )
         style.map(
-            "SafeCommandsOff.TCheckbutton",
+            "ToggleOff.TCheckbutton",
             background=[("active", colors["safe_off_active"])],
         )
         style.configure(

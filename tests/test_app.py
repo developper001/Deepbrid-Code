@@ -11,7 +11,13 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from src.ai_api import AiChatResponse, AiConversation, AiMediaFile, AiPrompt
+from src.ai_api import (
+    AiAssistant,
+    AiChatResponse,
+    AiConversation,
+    AiMediaFile,
+    AiPrompt,
+)
 from src.app import DeepbridCodeApp
 from src.context import build_prompt
 from src.settings import (
@@ -20,8 +26,11 @@ from src.settings import (
     LAST_PROJECT,
     OUTPUT_LOG_PATH,
     REMOVE_IMAGES_AFTER_SEND,
+    SELECTED_ASSISTANT,
+    SELECTED_MODEL,
     TERMINAL_COMMAND_WHITELIST,
     TERMINAL_TOOLS_ENABLED,
+    WEB_SEARCH_ENABLED,
     WRAP_TEXT,
     SettingsStore,
 )
@@ -97,6 +106,14 @@ class AppStartupTests(unittest.TestCase):
                     )
                     self.assertEqual(app.assistant_selector.get(), "Default")
                     self.assertFalse(app.web_enabled)
+                    self.assertEqual(app.web_button.cget("text"), "Web: OFF")
+                    app.web_var.set(True)
+                    app._web_changed()
+                    self.assertEqual(app.web_button.cget("text"), "Web: ON")
+                    self.assertEqual(
+                        app.web_button.cget("style"),
+                        "ToggleOn.TCheckbutton",
+                    )
                     style = ttk.Style(root)
                     self.assertEqual(
                         style.lookup("TCombobox", "foreground", ("readonly",)),
@@ -117,7 +134,7 @@ class AppStartupTests(unittest.TestCase):
                     self.assertEqual(app.send_button.cget("text"), "Send")
                     self.assertEqual(app.send_button.pack_info()["side"], "right")
                     self.assertEqual(
-                        ttk.Style(root).lookup("SafeCommandsOff.TCheckbutton", "background"),
+                        ttk.Style(root).lookup("ToggleOff.TCheckbutton", "background"),
                         "#8f353d",
                     )
                     with patch.object(app.main_pane, "winfo_height", return_value=600):
@@ -190,7 +207,7 @@ class AppStartupTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         app.terminal_tools_button.cget("style"),
-                        "SafeCommandsOff.TCheckbutton",
+                        "ToggleOff.TCheckbutton",
                     )
 
                     app.terminal_tools_var.set(True)
@@ -210,7 +227,7 @@ class AppStartupTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         app.terminal_tools_button.cget("style"),
-                        "SafeCommandsOn.TCheckbutton",
+                        "ToggleOn.TCheckbutton",
                     )
                     self.assertTrue(
                         store.get_bool(TERMINAL_TOOLS_ENABLED, default=False)
@@ -222,6 +239,107 @@ class AppStartupTests(unittest.TestCase):
                     )
             finally:
                 root.destroy()
+
+    def test_web_search_preference_is_loaded_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            store = SettingsStore(root_path / "settings.sqlite3")
+            store.set_bool(WEB_SEARCH_ENABLED, True)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", store.database_path),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    self.assertTrue(app.web_enabled)
+                    self.assertTrue(app.web_var.get())
+                    self.assertEqual(app.web_button.cget("text"), "Web: ON")
+                    self.assertEqual(
+                        app.web_button.cget("style"),
+                        "ToggleOn.TCheckbutton",
+                    )
+
+                    app.web_var.set(False)
+                    app._web_changed()
+                    self.assertFalse(app.web_enabled)
+                    self.assertFalse(store.get_bool(WEB_SEARCH_ENABLED, default=True))
+                    self.assertEqual(app.web_button.cget("text"), "Web: OFF")
+
+                    app.web_var.set(True)
+                    app._web_changed()
+                    self.assertTrue(app.web_enabled)
+                    self.assertTrue(store.get_bool(WEB_SEARCH_ENABLED, default=False))
+                    self.assertEqual(app.web_button.cget("text"), "Web: ON")
+            finally:
+                root.destroy()
+
+    def test_model_and_assistant_preferences_are_saved_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            store = SettingsStore(root_path / "settings.sqlite3")
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", store.database_path),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    app = DeepbridCodeApp(root)
+                    app.model_selector.set("GPT-6 Luna · Fast")
+                    app._model_changed(SimpleNamespace())
+                    self.assertEqual(store.get(SELECTED_MODEL), "gpt-6-luna")
+
+                    assistant = AiAssistant("assistant-7", "Code Helper", "")
+                    app.api_assistants = [assistant]
+                    app.assistant_selector.configure(
+                        values=("Default", assistant.label)
+                    )
+                    app.assistant_selector.set(assistant.label)
+                    app._assistant_changed(SimpleNamespace())
+                    self.assertEqual(store.get(SELECTED_ASSISTANT), "assistant-7")
+            finally:
+                root.destroy()
+
+            restored_root = tk.Tk()
+            restored_root.withdraw()
+            try:
+                with (
+                    patch("src.app.SETTINGS_DATABASE", store.database_path),
+                    patch("src.app.APP_DATA_DIR", root_path),
+                ):
+                    restored_app = DeepbridCodeApp(restored_root)
+                    self.assertEqual(
+                        restored_app.model_selector.get(),
+                        "GPT-6 Luna · Fast",
+                    )
+                    self.assertEqual(
+                        restored_app.assistant_selector.get(),
+                        "Default",
+                    )
+                    restored_app.api_options_events.put(
+                        (
+                            "success",
+                            (
+                                restored_app.api_key_generation,
+                                list(restored_app.api_models),
+                                [assistant],
+                            ),
+                        )
+                    )
+                    restored_app._poll_api_options_events()
+                    self.assertEqual(
+                        restored_app.model_selector.get(),
+                        "GPT-6 Luna · Fast",
+                    )
+                    self.assertEqual(
+                        restored_app.assistant_selector.get(),
+                        assistant.label,
+                    )
+                    self.assertEqual(restored_app.ai_assistant, "assistant-7")
+            finally:
+                restored_root.destroy()
 
     def test_project_file_context_menu_adds_the_selected_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -649,6 +767,40 @@ class AppStartupTests(unittest.TestCase):
                         app._set_api_key,
                         app.terminal_command_whitelist,
                         app._set_terminal_command_whitelist,
+                    )
+                    self.assertIsInstance(dialog.settings_canvas, tk.Canvas)
+                    self.assertIsInstance(dialog.settings_scrollbar, ttk.Scrollbar)
+                    with patch.object(dialog.settings_canvas, "yview_scroll") as scroll:
+                        self.assertEqual(
+                            dialog._scroll_settings(SimpleNamespace(delta=-120)),
+                            "break",
+                        )
+                        scroll.assert_called_once_with(1, "units")
+                    dialog.api_key.set("unsaved-test-key")
+                    with (
+                        patch("src.settings_dialog.DeepbridApiClient") as api_client,
+                        patch("src.settings_dialog.threading.Thread") as thread,
+                    ):
+                        dialog._test_api_key()
+                        api_client.assert_not_called()
+                        worker = thread.call_args.kwargs
+                        worker["target"](*worker["args"])
+                        self.assertIsNotNone(dialog.api_key_test_after_id)
+                        dialog.dialog.after_cancel(dialog.api_key_test_after_id)
+                        dialog.api_key_test_after_id = None
+                        dialog._poll_api_key_test_events()
+                    api_client.assert_called_once_with("unsaved-test-key")
+                    api_client.return_value.list_models.assert_called_once_with()
+                    api_client.return_value.list_assistants.assert_called_once_with()
+                    self.assertIn("works", dialog.api_key_status.get())
+                    self.assertEqual(
+                        str(dialog.api_key_test_button.cget("state")),
+                        "normal",
+                    )
+                    self.assertEqual(app.api_key, "")
+                    self.assertEqual(
+                        dialog._scroll_settings(SimpleNamespace(num=5)),
+                        "break",
                     )
                     dialog.dark_theme.set(True)
                     dialog._save_dark_theme()

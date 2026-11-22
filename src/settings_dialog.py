@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import queue
 import sqlite3
+import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
 from typing import Callable, Protocol
 
+from .ai_api import DeepbridApiClient, DeepbridApiError
 from .settings import (
     DARK_THEME,
     DIAGNOSTICS_ENABLED,
@@ -61,6 +64,9 @@ class SettingsDialog:
         self.dialog.geometry("640x560")
         self.dialog.minsize(560, 500)
         self.dialog.transient(parent)
+        self.api_key_test_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.api_key_test_active = False
+        self.api_key_test_after_id: str | None = None
 
         frame = ttk.Frame(self.dialog, padding=16)
         frame.pack(fill="both", expand=True)
@@ -89,8 +95,44 @@ class SettingsDialog:
             padding=(10, 6),
         ).pack(fill="x", pady=(6, 0))
 
-        content = ttk.Frame(frame, padding=12, relief="groove")
-        content.grid(row=0, column=1, sticky="nsew")
+        style = ttk.Style(self.dialog)
+        self.settings_canvas = tk.Canvas(
+            frame,
+            background=style.lookup("TFrame", "background"),
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.settings_canvas.grid(row=0, column=1, sticky="nsew")
+        self.settings_scrollbar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.settings_canvas.yview,
+        )
+        self.settings_scrollbar.grid(row=0, column=2, sticky="ns")
+        self.settings_canvas.configure(yscrollcommand=self.settings_scrollbar.set)
+        content = ttk.Frame(self.settings_canvas, padding=12, relief="groove")
+        settings_window = self.settings_canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+        content.bind(
+            "<Configure>",
+            lambda _event: self.settings_canvas.configure(
+                scrollregion=self.settings_canvas.bbox("all")
+            ),
+        )
+        self.settings_canvas.bind(
+            "<Configure>",
+            lambda event: self.settings_canvas.itemconfigure(
+                settings_window,
+                width=event.width,
+            ),
+        )
+        self.dialog.bind("<MouseWheel>", self._scroll_settings, add="+")
+        self.dialog.bind("<Button-4>", self._scroll_settings, add="+")
+        self.dialog.bind("<Button-5>", self._scroll_settings, add="+")
+        self.dialog.bind("<Destroy>", self._on_dialog_destroy, add="+")
         content.columnconfigure(0, weight=1)
         content.columnconfigure(1, weight=0)
         ttk.Label(content, text="Deepbrid AI API", font=("TkDefaultFont", 14, "bold")).grid(
@@ -136,6 +178,12 @@ class SettingsDialog:
             text="Save",
             command=self._save_api_key,
         ).grid(row=0, column=2, padx=(8, 0))
+        self.api_key_test_button = ttk.Button(
+            api_key_controls,
+            text="Test",
+            command=self._test_api_key,
+        )
+        self.api_key_test_button.grid(row=0, column=3, padx=(8, 0))
         ttk.Label(
             content,
             text="Get a key at https://www.deepbrid.com/devices",
@@ -282,6 +330,84 @@ class SettingsDialog:
         self.saved_output_log_path = output_log_path
         self.saved_api_key = api_key
 
+    def _scroll_settings(self, event: tk.Event) -> str:
+        if getattr(event, "delta", 0):
+            units = int(-event.delta / 120)
+            if not units:
+                units = -1 if event.delta > 0 else 1
+        else:
+            units = {4: -1, 5: 1}.get(getattr(event, "num", None), 0)
+        if units:
+            self.settings_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_dialog_destroy(self, event: tk.Event) -> None:
+        if event.widget is self.dialog and self.api_key_test_after_id is not None:
+            try:
+                self.dialog.after_cancel(self.api_key_test_after_id)
+            except tk.TclError:
+                pass
+            self.api_key_test_after_id = None
+
+    def _test_api_key(self) -> None:
+        if self.api_key_test_active:
+            return
+        api_key = self.api_key.get().strip()
+        if not api_key:
+            self.api_key_status.set("Enter an API key first.")
+            return
+        self.api_key_test_active = True
+        self.api_key_test_button.configure(state="disabled")
+        self.api_key_status.set("Checking access to Deepbrid AI models and assistants...")
+        worker = threading.Thread(
+            target=self._test_api_key_worker,
+            args=(api_key,),
+            name="deepbrid-api-key-test",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self.api_key_test_active = False
+            self.api_key_test_button.configure(state="normal")
+            self.api_key_status.set(f"Could not start API key test: {error}")
+            return
+        self.api_key_test_after_id = self.dialog.after(
+            100,
+            self._poll_api_key_test_events,
+        )
+
+    def _test_api_key_worker(self, api_key: str) -> None:
+        try:
+            client = DeepbridApiClient(api_key)
+            client.list_models()
+            client.list_assistants()
+        except (DeepbridApiError, OSError, RuntimeError, ValueError) as error:
+            self.api_key_test_events.put(("error", str(error)))
+        else:
+            self.api_key_test_events.put(
+                ("success", "API key works with the models and assistants endpoints.")
+            )
+
+    def _poll_api_key_test_events(self) -> None:
+        self.api_key_test_after_id = None
+        while True:
+            try:
+                _event, message = self.api_key_test_events.get_nowait()
+            except queue.Empty:
+                break
+            self.api_key_test_active = False
+            self.api_key_test_button.configure(state="normal")
+            self.api_key_status.set(message)
+        if self.api_key_test_active:
+            try:
+                self.api_key_test_after_id = self.dialog.after(
+                    100,
+                    self._poll_api_key_test_events,
+                )
+            except tk.TclError:
+                self.api_key_test_active = False
+
     def _open_terminal_whitelist(self) -> None:
         if self.on_terminal_whitelist_changed is None:
             return
@@ -311,6 +437,9 @@ class SettingsDialog:
             return
         self.saved_dark_theme = enabled
         self.on_dark_theme_changed(enabled)
+        self.settings_canvas.configure(
+            background=ttk.Style(self.dialog).lookup("TFrame", "background"),
+        )
         self.dialog.configure(
             background="#202522" if enabled else "#f0f2f0",
         )
