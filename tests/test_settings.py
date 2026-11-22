@@ -31,7 +31,7 @@ class SettingsStoreTests(unittest.TestCase):
             store.set_bool(TERMINAL_TOOLS_ENABLED, True)
             store.set(
                 TERMINAL_COMMAND_WHITELIST,
-                '["ls","python --version"]',
+                "ls\npython --version",
             )
             store.set(LAST_PROJECT, "C:/projects/example")
 
@@ -42,7 +42,7 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertTrue(reopened.get_bool(TERMINAL_TOOLS_ENABLED, default=False))
             self.assertEqual(
                 reopened.get(TERMINAL_COMMAND_WHITELIST),
-                '["ls","python --version"]',
+                "ls\npython --version",
             )
             self.assertEqual(reopened.get(LAST_PROJECT), "C:/projects/example")
 

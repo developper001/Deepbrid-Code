@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import tempfile
 import tkinter as tk
@@ -28,7 +27,7 @@ from src.settings import (
 )
 from src.personalization_dialog import PersonalizationDialog
 from src.settings_dialog import SettingsDialog
-from src.terminal_tools import ALLOWED_TERMINAL_COMMANDS
+from src.terminal_tools import DEFAULT_TERMINAL_COMMAND_WHITELIST
 
 
 class AppStartupTests(unittest.TestCase):
@@ -117,6 +116,10 @@ class AppStartupTests(unittest.TestCase):
                     self.assertEqual(app.sessions_button.cget("text"), "Conversations")
                     self.assertEqual(app.send_button.cget("text"), "Send")
                     self.assertEqual(app.send_button.pack_info()["side"], "right")
+                    self.assertEqual(
+                        ttk.Style(root).lookup("SafeCommandsOff.TCheckbutton", "background"),
+                        "#8f353d",
+                    )
                     with patch.object(app.main_pane, "winfo_height", return_value=600):
                         app._size_project_tree(SimpleNamespace())
                     self.assertEqual(app.file_tree.master.grid_rowconfigure(1, "minsize"), 270)
@@ -181,6 +184,14 @@ class AppStartupTests(unittest.TestCase):
                     app = DeepbridCodeApp(root)
                     self.assertFalse(app.allow_terminal_tools)
                     self.assertFalse(app.terminal_tools_var.get())
+                    self.assertEqual(
+                        app.terminal_tools_button.cget("text"),
+                        "Allow safe commands: OFF",
+                    )
+                    self.assertEqual(
+                        app.terminal_tools_button.cget("style"),
+                        "SafeCommandsOff.TCheckbutton",
+                    )
 
                     app.terminal_tools_var.set(True)
                     app._set_terminal_tools_enabled()
@@ -193,8 +204,21 @@ class AppStartupTests(unittest.TestCase):
                     app.terminal_tools_var.set(True)
                     app._set_terminal_tools_enabled()
                     self.assertTrue(app.allow_terminal_tools)
+                    self.assertEqual(
+                        app.terminal_tools_button.cget("text"),
+                        "Allow safe commands: ON",
+                    )
+                    self.assertEqual(
+                        app.terminal_tools_button.cget("style"),
+                        "SafeCommandsOn.TCheckbutton",
+                    )
                     self.assertTrue(
                         store.get_bool(TERMINAL_TOOLS_ENABLED, default=False)
+                    )
+                    app.terminal_tools_var.set(False)
+                    app._set_terminal_tools_enabled()
+                    self.assertFalse(
+                        store.get_bool(TERMINAL_TOOLS_ENABLED, default=True)
                     )
             finally:
                 root.destroy()
@@ -623,7 +647,7 @@ class AppStartupTests(unittest.TestCase):
                         app._set_output_logging,
                         app.api_key,
                         app._set_api_key,
-                        app.allowed_terminal_commands,
+                        app.terminal_command_whitelist,
                         app._set_terminal_command_whitelist,
                     )
                     dialog.dark_theme.set(True)
@@ -636,25 +660,27 @@ class AppStartupTests(unittest.TestCase):
                     whitelist = dialog.terminal_whitelist_dialog
                     self.assertIsNotNone(whitelist)
                     assert whitelist is not None
-                    whitelist.command_vars["ls"].set(False)
+                    patterns_without_ls = tuple(
+                        pattern
+                        for pattern in app.terminal_command_whitelist
+                        if pattern != "ls"
+                    )
+                    whitelist.pattern_editor.delete("1.0", "end")
+                    whitelist.pattern_editor.insert(
+                        "1.0",
+                        "\n".join(patterns_without_ls),
+                    )
                     whitelist._save()
-                    self.assertNotIn("ls", app.allowed_terminal_commands)
+                    self.assertNotIn("ls", app.terminal_command_whitelist)
                     self.assertEqual(
                         app.settings.get(TERMINAL_COMMAND_WHITELIST),
-                        json.dumps(
-                            [
-                                command
-                                for command in ALLOWED_TERMINAL_COMMANDS
-                                if command != "ls"
-                            ]
-                        ),
+                        "\n".join(patterns_without_ls),
                     )
                     dialog._open_terminal_whitelist()
                     empty_whitelist = dialog.terminal_whitelist_dialog
                     self.assertIsNotNone(empty_whitelist)
                     assert empty_whitelist is not None
-                    for command_var in empty_whitelist.command_vars.values():
-                        command_var.set(False)
+                    empty_whitelist.pattern_editor.delete("1.0", "end")
                     empty_whitelist._save()
                     self.assertTrue(empty_whitelist.dialog.winfo_exists())
                     self.assertIn("at least one", empty_whitelist.status.get())
@@ -807,7 +833,7 @@ class AppStartupTests(unittest.TestCase):
                     app.api_key = "test-api-key"
                     app._load_project(project)
                     app.allow_terminal_tools = True
-                    app.allowed_terminal_commands = ("python --version",)
+                    app.terminal_command_whitelist = ("python --version",)
                     app.terminal_tools_var.set(True)
                     app.message.insert("1.0", "List the project files.")
                     with patch("src.app.threading.Thread") as thread:
@@ -837,7 +863,9 @@ class AppStartupTests(unittest.TestCase):
                     app = DeepbridCodeApp(root)
                     app.project_root = root_path
                     app.active_project_root = root_path
-                    app.active_terminal_commands = ALLOWED_TERMINAL_COMMANDS
+                    app.active_terminal_command_whitelist = (
+                        DEFAULT_TERMINAL_COMMAND_WHITELIST
+                    )
                     app.allow_terminal_tools = True
                     app.chat_tool_mode = True
                     app.chat_request_active = True
@@ -854,7 +882,7 @@ class AppStartupTests(unittest.TestCase):
                     thread.assert_called_once()
                     self.assertEqual(
                         thread.call_args.kwargs["args"],
-                        ("ls", root_path, ALLOWED_TERMINAL_COMMANDS),
+                        ("ls", root_path, DEFAULT_TERMINAL_COMMAND_WHITELIST),
                     )
                     self.assertEqual(
                         thread.call_args.kwargs["target"].__name__,
@@ -879,7 +907,9 @@ class AppStartupTests(unittest.TestCase):
                     app.chat_tool_mode = True
                     app.chat_request_active = True
                     app.active_project_root = root_path
-                    app.active_terminal_commands = ALLOWED_TERMINAL_COMMANDS
+                    app.active_terminal_command_whitelist = (
+                        DEFAULT_TERMINAL_COMMAND_WHITELIST
+                    )
                     app.active_chat_options = ("gpt-6.1-sol", None, False)
                     app.chat_events.put(
                         (

@@ -12,7 +12,10 @@ from .settings import (
     SecretStorageError,
     WRAP_TEXT,
 )
-from .terminal_tools import ALLOWED_TERMINAL_COMMANDS, normalize_terminal_commands
+from .terminal_tools import (
+    DEFAULT_TERMINAL_COMMAND_WHITELIST,
+    normalize_terminal_command_whitelist,
+)
 
 
 class SettingsBackend(Protocol):
@@ -38,8 +41,8 @@ class SettingsDialog:
         on_output_logging_changed: Callable[[str], None],
         api_key: str = "",
         on_api_key_changed: Callable[[str], None] | None = None,
-        allowed_terminal_commands: tuple[str, ...] = ALLOWED_TERMINAL_COMMANDS,
-        on_terminal_commands_changed: Callable[[tuple[str, ...]], None] | None = None,
+        terminal_command_whitelist: tuple[str, ...] = DEFAULT_TERMINAL_COMMAND_WHITELIST,
+        on_terminal_whitelist_changed: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         self.settings = settings
         self.on_dark_theme_changed = on_dark_theme_changed
@@ -48,10 +51,10 @@ class SettingsDialog:
         self.on_diagnostics_enabled_changed = on_diagnostics_enabled_changed
         self.on_output_logging_changed = on_output_logging_changed
         self.on_api_key_changed = on_api_key_changed
-        self.allowed_terminal_commands = normalize_terminal_commands(
-            allowed_terminal_commands
+        self.terminal_command_whitelist = normalize_terminal_command_whitelist(
+            terminal_command_whitelist
         )
-        self.on_terminal_commands_changed = on_terminal_commands_changed
+        self.on_terminal_whitelist_changed = on_terminal_whitelist_changed
         self.terminal_whitelist_dialog: TerminalWhitelistDialog | None = None
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
@@ -184,7 +187,7 @@ class SettingsDialog:
             content,
             text="Command whitelist...",
             command=self._open_terminal_whitelist,
-            state="normal" if on_terminal_commands_changed else "disabled",
+            state="normal" if on_terminal_whitelist_changed else "disabled",
         )
         self.terminal_whitelist_button.grid(
             row=9,
@@ -280,22 +283,22 @@ class SettingsDialog:
         self.saved_api_key = api_key
 
     def _open_terminal_whitelist(self) -> None:
-        if self.on_terminal_commands_changed is None:
+        if self.on_terminal_whitelist_changed is None:
             return
         self.terminal_whitelist_dialog = TerminalWhitelistDialog(
             self.dialog,
-            self.allowed_terminal_commands,
-            self._save_terminal_commands,
+            self.terminal_command_whitelist,
+            self._save_terminal_whitelist,
         )
 
-    def _save_terminal_commands(self, commands: tuple[str, ...]) -> None:
-        if self.on_terminal_commands_changed is None:
+    def _save_terminal_whitelist(self, patterns: tuple[str, ...]) -> None:
+        if self.on_terminal_whitelist_changed is None:
             return
-        normalized = normalize_terminal_commands(commands)
+        normalized = normalize_terminal_command_whitelist(patterns)
         if not normalized:
-            raise ValueError("Enable at least one command in the whitelist.")
-        self.on_terminal_commands_changed(normalized)
-        self.allowed_terminal_commands = normalized
+            raise ValueError("Add at least one command pattern to the whitelist.")
+        self.on_terminal_whitelist_changed(normalized)
+        self.terminal_command_whitelist = normalized
         self.status.set("Saved terminal command whitelist.")
 
     def _save_dark_theme(self) -> None:
@@ -422,7 +425,7 @@ class TerminalWhitelistDialog:
     def __init__(
         self,
         parent: tk.Toplevel,
-        allowed_commands: tuple[str, ...],
+        whitelist_patterns: tuple[str, ...],
         on_save: Callable[[tuple[str, ...]], None],
     ) -> None:
         self.on_save = on_save
@@ -437,28 +440,27 @@ class TerminalWhitelistDialog:
         ttk.Label(
             frame,
             text=(
-                "Choose which built-in commands the assistant may request. "
-                "Custom commands are not supported. You will still approve "
-                "each command before it runs."
+                "Enter one command pattern per line. An asterisk (*) matches "
+                "one argument, so `ls *` matches `ls -a`. This is not shell "
+                "expansion. Only the app's built-in safe operations are supported; "
+                "custom executables and scripts cannot be added. Each run still "
+                "requires your approval."
             ),
             wraplength=640,
             justify="left",
         ).pack(anchor="w", pady=(0, 12))
-
-        selected_commands = set(normalize_terminal_commands(allowed_commands))
-        self.command_vars = {
-            command: tk.BooleanVar(
-                master=self.dialog,
-                value=command in selected_commands,
-            )
-            for command in ALLOWED_TERMINAL_COMMANDS
-        }
-        for command in ALLOWED_TERMINAL_COMMANDS:
-            ttk.Checkbutton(
-                frame,
-                text=command,
-                variable=self.command_vars[command],
-            ).pack(anchor="w", pady=2)
+        editor_frame = ttk.Frame(frame)
+        editor_frame.pack(fill="both", expand=True)
+        self.pattern_editor = tk.Text(editor_frame, height=8, wrap="none")
+        pattern_scrollbar = ttk.Scrollbar(
+            editor_frame,
+            orient="vertical",
+            command=self.pattern_editor.yview,
+        )
+        self.pattern_editor.configure(yscrollcommand=pattern_scrollbar.set)
+        self.pattern_editor.pack(side="left", fill="both", expand=True)
+        pattern_scrollbar.pack(side="right", fill="y")
+        self.pattern_editor.insert("1.0", "\n".join(whitelist_patterns))
 
         self.status = tk.StringVar(master=self.dialog)
         ttk.Label(frame, textvariable=self.status).pack(anchor="w", pady=(8, 0))
@@ -474,16 +476,18 @@ class TerminalWhitelistDialog:
         self.dialog.grab_set()
 
     def _save(self) -> None:
-        commands = tuple(
-            command
-            for command in ALLOWED_TERMINAL_COMMANDS
-            if self.command_vars[command].get()
-        )
-        if not commands:
-            self.status.set("Enable at least one command in the whitelist.")
+        try:
+            patterns = normalize_terminal_command_whitelist(
+                self.pattern_editor.get("1.0", "end-1c").splitlines()
+            )
+        except ValueError as error:
+            self.status.set(str(error))
+            return
+        if not patterns:
+            self.status.set("Add at least one command pattern to the whitelist.")
             return
         try:
-            self.on_save(commands)
+            self.on_save(patterns)
         except (OSError, ValueError, sqlite3.Error) as error:
             self.status.set(f"Could not save terminal command whitelist: {error}")
             return

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import queue
 import sqlite3
@@ -56,9 +55,10 @@ from .terminal_tools import (
     TerminalCommandResult,
     add_terminal_tool_instructions,
     load_terminal_command_whitelist,
-    normalize_terminal_commands,
+    normalize_terminal_command_whitelist,
     parse_terminal_tool_request,
     run_allowed_terminal_command,
+    terminal_command_matches_whitelist,
 )
 
 APP_DATA_DIR = Path(
@@ -106,9 +106,13 @@ class DeepbridCodeApp:
             TERMINAL_TOOLS_ENABLED,
             default=False,
         )
-        self.allowed_terminal_commands = load_terminal_command_whitelist(
-            self.settings.get(TERMINAL_COMMAND_WHITELIST)
+        saved_terminal_whitelist = self.settings.get(TERMINAL_COMMAND_WHITELIST)
+        self.terminal_command_whitelist = load_terminal_command_whitelist(
+            saved_terminal_whitelist
         )
+        serialized_whitelist = "\n".join(self.terminal_command_whitelist)
+        if saved_terminal_whitelist != serialized_whitelist:
+            self.settings.set(TERMINAL_COMMAND_WHITELIST, serialized_whitelist)
         self.output_log_enabled = (
             self.diagnostics_enabled and bool(self.output_log_path.strip())
         )
@@ -167,7 +171,7 @@ class DeepbridCodeApp:
         self.terminal_tool_calls = 0
         self.active_chat_options: tuple[str, str | None, bool] | None = None
         self.active_project_root: Path | None = None
-        self.active_terminal_commands: tuple[str, ...] = ()
+        self.active_terminal_command_whitelist: tuple[str, ...] = ()
         self.media_preview_images: list[ImageTk.PhotoImage] = []
 
         self._build_ui()
@@ -228,10 +232,18 @@ class DeepbridCodeApp:
         )
         self.terminal_tools_button = ttk.Checkbutton(
             toolbar,
-            text="Allow safe commands",
+            text=(
+                "Allow safe commands: ON"
+                if self.allow_terminal_tools
+                else "Allow safe commands: OFF"
+            ),
             variable=self.terminal_tools_var,
             command=self._set_terminal_tools_enabled,
-            style="Toolbutton",
+            style=(
+                "SafeCommandsOn.TCheckbutton"
+                if self.allow_terminal_tools
+                else "SafeCommandsOff.TCheckbutton"
+            ),
         )
         self.terminal_tools_button.pack(side="left", padx=(12, 0))
 
@@ -417,24 +429,39 @@ class DeepbridCodeApp:
         enabled = self.terminal_tools_var.get()
         if enabled and self.project_root is None:
             self.terminal_tools_var.set(False)
+            self._update_terminal_tools_button()
             self.status.set("Open a project folder before enabling safe commands.")
             return
-        if enabled and not self.allowed_terminal_commands:
+        if enabled and not self.terminal_command_whitelist:
             self.terminal_tools_var.set(False)
+            self._update_terminal_tools_button()
             self.status.set("Enable at least one command in Settings first.")
             return
         try:
             self.settings.set_bool(TERMINAL_TOOLS_ENABLED, enabled)
         except sqlite3.Error as error:
             self.terminal_tools_var.set(self.allow_terminal_tools)
+            self._update_terminal_tools_button()
             self.status.set(f"Could not save terminal tool preference: {error}")
             self._log(f"Could not save terminal tool preference: {error}")
             return
         self.allow_terminal_tools = enabled
+        self._update_terminal_tools_button()
         self.status.set(
             "Safe commands enabled; the assistant must get your approval for every run."
             if enabled
             else "Safe commands disabled."
+        )
+
+    def _update_terminal_tools_button(self) -> None:
+        enabled = self.allow_terminal_tools
+        self.terminal_tools_button.configure(
+            text=f"Allow safe commands: {'ON' if enabled else 'OFF'}",
+            style=(
+                "SafeCommandsOn.TCheckbutton"
+                if enabled
+                else "SafeCommandsOff.TCheckbutton"
+            ),
         )
 
     def _add_additional_files(self) -> None:
@@ -582,7 +609,7 @@ class DeepbridCodeApp:
                 self._set_output_logging,
                 self.api_key,
                 self._set_api_key,
-                self.allowed_terminal_commands,
+                self.terminal_command_whitelist,
                 self._set_terminal_command_whitelist,
             )
         except (OSError, sqlite3.Error) as error:
@@ -620,16 +647,16 @@ class DeepbridCodeApp:
 
     def _set_terminal_command_whitelist(
         self,
-        commands: tuple[str, ...],
+        patterns: tuple[str, ...],
     ) -> None:
-        normalized = normalize_terminal_commands(commands)
+        normalized = normalize_terminal_command_whitelist(patterns)
         if not normalized:
-            raise ValueError("Enable at least one command in the whitelist.")
+            raise ValueError("Add at least one command pattern to the whitelist.")
         self.settings.set(
             TERMINAL_COMMAND_WHITELIST,
-            json.dumps(list(normalized)),
+            "\n".join(normalized),
         )
-        self.allowed_terminal_commands = normalized
+        self.terminal_command_whitelist = normalized
         self.status.set("Saved terminal command whitelist.")
 
     def _assistant_changed(self, _event: tk.Event) -> None:
@@ -1176,6 +1203,11 @@ class DeepbridCodeApp:
                 "accent": "#7898ff",
                 "selection": "#2e426e",
                 "border": "#56615b",
+                "safe_on": "#2e7d4f",
+                "safe_on_active": "#3a9560",
+                "safe_off": "#8f353d",
+                "safe_off_active": "#aa414a",
+                "safe_toggle_foreground": "#ffffff",
             }
         else:
             colors = {
@@ -1187,6 +1219,11 @@ class DeepbridCodeApp:
                 "accent": "#3569f6",
                 "selection": "#dbe6ff",
                 "border": "#aab5c2",
+                "safe_on": "#c6efce",
+                "safe_on_active": "#a9dfb4",
+                "safe_off": "#f8d7da",
+                "safe_off_active": "#efbdc2",
+                "safe_toggle_foreground": "#202b25",
             }
         self.theme_colors = colors
         self.root.configure(background=colors["background"])
@@ -1267,6 +1304,28 @@ class DeepbridCodeApp:
             "TCheckbutton",
             background=[("active", colors["background"])],
             foreground=[("disabled", colors["disabled_foreground"])],
+        )
+        style.configure(
+            "SafeCommandsOn.TCheckbutton",
+            background=colors["safe_on"],
+            foreground=colors["safe_toggle_foreground"],
+            padding=(10, 5),
+            relief="raised",
+        )
+        style.map(
+            "SafeCommandsOn.TCheckbutton",
+            background=[("active", colors["safe_on_active"])],
+        )
+        style.configure(
+            "SafeCommandsOff.TCheckbutton",
+            background=colors["safe_off"],
+            foreground=colors["safe_toggle_foreground"],
+            padding=(10, 5),
+            relief="raised",
+        )
+        style.map(
+            "SafeCommandsOff.TCheckbutton",
+            background=[("active", colors["safe_off_active"])],
         )
         style.configure(
             "Treeview",
@@ -1837,12 +1896,12 @@ class DeepbridCodeApp:
             if (
                 self.allow_terminal_tools
                 and self.project_root is not None
-                and self.allowed_terminal_commands
+                and self.terminal_command_whitelist
             )
             else None
         )
-        self.active_terminal_commands = (
-            self.allowed_terminal_commands
+        self.active_terminal_command_whitelist = (
+            self.terminal_command_whitelist
             if self.active_project_root is not None
             else ()
         )
@@ -1850,7 +1909,10 @@ class DeepbridCodeApp:
         self.terminal_tool_calls = 0
         self.active_chat_options = (selected_model, selected_assistant, web_enabled)
         api_prompt = (
-            add_terminal_tool_instructions(prompt, self.active_terminal_commands)
+            add_terminal_tool_instructions(
+                prompt,
+                self.active_terminal_command_whitelist,
+            )
             if self.chat_tool_mode
             else prompt
         )
@@ -1950,9 +2012,9 @@ class DeepbridCodeApp:
 
     def _handle_terminal_tool_request(self, command: str) -> None:
         project_root = self.active_project_root
-        if (
-            command not in self.active_terminal_commands
-            or command not in self.allowed_terminal_commands
+        if not terminal_command_matches_whitelist(
+            command,
+            self.active_terminal_command_whitelist,
         ):
             self._set_chat_idle()
             message = "The requested command is not in your enabled whitelist."
@@ -2004,7 +2066,7 @@ class DeepbridCodeApp:
         )
         worker = threading.Thread(
             target=self._terminal_command_worker,
-            args=(command, project_root, self.active_terminal_commands),
+            args=(command, project_root, self.active_terminal_command_whitelist),
             name="deepbrid-terminal-command",
             daemon=True,
         )
@@ -2068,7 +2130,7 @@ class DeepbridCodeApp:
         api_prompt = (
             add_terminal_tool_instructions(
                 tool_result,
-                self.active_terminal_commands,
+                self.active_terminal_command_whitelist,
             )
             if self.chat_tool_mode
             else tool_result
@@ -2191,7 +2253,7 @@ class DeepbridCodeApp:
         self.chat_tool_mode = False
         self.active_chat_options = None
         self.active_project_root = None
-        self.active_terminal_commands = ()
+        self.active_terminal_command_whitelist = ()
         self.send_button.configure(
             text="Send",
             command=self._send,
@@ -2221,7 +2283,7 @@ class DeepbridCodeApp:
                     try:
                         command = parse_terminal_tool_request(
                             payload.content,
-                            self.active_terminal_commands,
+                            self.active_terminal_command_whitelist,
                         )
                     except ValueError as error:
                         self._set_chat_idle()

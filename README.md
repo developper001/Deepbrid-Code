@@ -128,22 +128,24 @@ in-memory conversation is preceded by a timestamped separator.
 Open a project folder and enable **Allow safe commands** in the top toolbar
 to let the assistant request a small set of local development operations. This
 option is off by default. Every request shows the exact command and project
-directory in a confirmation dialog; declining prevents execution. Approved
-commands are limited to the built-in list below. Use **Settings** >
-**Command whitelist...** to choose which of these commands the assistant may
-request; custom commands cannot be added:
+directory in a confirmation dialog; declining prevents execution. Edit the
+whitelist in **Settings** > **Command whitelist...**, with one pattern per
+line. An asterisk matches exactly one argument, not shell expansion; for
+example, `ls *` permits `ls -a`. The editor accepts patterns only for the
+safe operations supported by the app; arbitrary executables and scripts
+cannot be added:
 
 - `ls` (lists the open project folder)
+- `ls -a` or `ls --all` (includes hidden files)
 - `git status --short --branch`
 - `python --version`
 - `python -m unittest discover -s tests -v`
 - `python -m compileall -q src tests`
 
 Commands run in the project directory used for that chat. The app does not
-invoke a shell or accept arbitrary commands, arguments, Python snippets, or
-script paths. The test command does execute the project's test code, so approve
-it only when you trust that code. Results are returned to Deepbrid AI Chat so
-the assistant can continue. Deepbrid's API does not expose native tool
+invoke a shell. The test command does execute the project's test code, so
+approve it only when you trust that code. Results are returned to Deepbrid AI
+Chat so the assistant can continue. Deepbrid's API does not expose native tool
 calling, so this feature uses a constrained response protocol and the assistant
 may not always request a command in the expected format.
 

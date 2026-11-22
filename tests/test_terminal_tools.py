@@ -7,11 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.terminal_tools import (
-    ALLOWED_TERMINAL_COMMANDS,
+    DEFAULT_TERMINAL_COMMAND_WHITELIST,
     MAX_TERMINAL_OUTPUT,
     TerminalCommandResult,
     add_terminal_tool_instructions,
     load_terminal_command_whitelist,
+    normalize_terminal_command_whitelist,
     parse_terminal_tool_request,
     run_allowed_terminal_command,
 )
@@ -19,7 +20,7 @@ from src.terminal_tools import (
 
 class TerminalToolTests(unittest.TestCase):
     def test_terminal_request_parser_accepts_only_exact_allowlisted_requests(self) -> None:
-        command = ALLOWED_TERMINAL_COMMANDS[1]
+        command = "git status --short --branch"
         self.assertEqual(
             parse_terminal_tool_request(
                 f'{{"deepbrid_tool":"terminal","command":"{command}"}}'
@@ -32,7 +33,7 @@ class TerminalToolTests(unittest.TestCase):
                 '{"deepbrid_tool":"other","command":"git status --short --branch"}'
             )
         )
-        with self.assertRaisesRegex(ValueError, "not in your enabled whitelist"):
+        with self.assertRaisesRegex(ValueError, "whitelist"):
             parse_terminal_tool_request(
                 '{"deepbrid_tool":"terminal","command":"python -c \\"print(1)\\""}'
             )
@@ -44,32 +45,47 @@ class TerminalToolTests(unittest.TestCase):
     def test_tool_protocol_is_added_only_to_the_api_prompt(self) -> None:
         prompt = add_terminal_tool_instructions("Review this project.")
         self.assertTrue(prompt.startswith("Review this project."))
-        self.assertIn("Do not add arguments or shell operators", prompt)
+        self.assertIn("asterisk (*) matches one argument", prompt)
+        self.assertIn("Do not use shell operators", prompt)
         self.assertIn("python --version", prompt)
 
-    def test_saved_whitelist_is_limited_to_supported_commands(self) -> None:
+    def test_saved_whitelist_patterns_are_limited_to_safe_operations(self) -> None:
         self.assertEqual(
             load_terminal_command_whitelist(None),
-            ALLOWED_TERMINAL_COMMANDS,
+            DEFAULT_TERMINAL_COMMAND_WHITELIST,
         )
         self.assertEqual(
             load_terminal_command_whitelist('["python --version","ls"]'),
-            ("ls", "python --version"),
+            ("python --version", "ls"),
         )
-        with self.assertRaisesRegex(ValueError, "unsupported commands"):
+        self.assertEqual(
+            load_terminal_command_whitelist("ls *\npython --version"),
+            ("ls *", "python --version"),
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported terminal whitelist pattern"):
             load_terminal_command_whitelist('["python arbitrary.py"]')
+        with self.assertRaisesRegex(ValueError, "Unsupported terminal whitelist pattern"):
+            normalize_terminal_command_whitelist(["python *"])
 
-        with self.assertRaisesRegex(ValueError, "enabled whitelist"):
+        with self.assertRaisesRegex(ValueError, "Settings whitelist"):
             parse_terminal_tool_request(
                 '{"deepbrid_tool":"terminal","command":"git status --short --branch"}',
                 ("ls",),
             )
+        self.assertEqual(
+            parse_terminal_tool_request(
+                '{"deepbrid_tool":"terminal","command":"ls -a"}',
+                ("ls *",),
+            ),
+            "ls -a",
+        )
 
     def test_ls_lists_only_the_open_project_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "z-file.txt").write_text("ignored", encoding="utf-8")
             (root / "a-directory").mkdir()
+            (root / ".hidden").write_text("hidden", encoding="utf-8")
 
             result = run_allowed_terminal_command("ls", root)
 
@@ -77,6 +93,13 @@ class TerminalToolTests(unittest.TestCase):
             self.assertEqual(result.working_directory, root.resolve())
             self.assertEqual(result.stdout, "a-directory/\nz-file.txt")
             self.assertEqual(result.stderr, "")
+
+    def test_ls_wildcard_allows_hidden_file_listing_without_shell_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / ".hidden").write_text("hidden", encoding="utf-8")
+            result = run_allowed_terminal_command("ls -a", root, ("ls *",))
+            self.assertEqual(result.stdout, ".hidden")
 
     def test_process_commands_use_fixed_arguments_without_a_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -112,14 +135,14 @@ class TerminalToolTests(unittest.TestCase):
     def test_unapproved_command_is_rejected_before_process_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             with patch("src.terminal_tools.subprocess.run") as run:
-                with self.assertRaisesRegex(ValueError, "not in your enabled whitelist"):
+                with self.assertRaisesRegex(ValueError, "Settings whitelist"):
                     run_allowed_terminal_command("python my_script.py", Path(temporary_directory))
             run.assert_not_called()
 
     def test_runner_rejects_commands_disabled_in_the_saved_whitelist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             with patch("src.terminal_tools.subprocess.run") as run:
-                with self.assertRaisesRegex(ValueError, "enabled whitelist"):
+                with self.assertRaisesRegex(ValueError, "Settings whitelist"):
                     run_allowed_terminal_command(
                         "git status --short --branch",
                         Path(temporary_directory),
