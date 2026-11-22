@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from src.ai_api import (
@@ -62,6 +64,32 @@ class _BinaryResponse(_Response):
 
 
 class DeepbridApiClientTests(unittest.TestCase):
+    def test_chat_http_errors_include_safe_request_diagnostics(self) -> None:
+        error = HTTPError(
+            "https://www.deepbrid.com/api/v1/ai/chat",
+            403,
+            "Forbidden",
+            {
+                "Content-Type": "application/json",
+                "X-Request-ID": "request-123",
+            },
+            BytesIO(b""),
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(DeepbridApiError) as raised:
+                DeepbridApiClient("test-key").chat_stream(
+                    "private prompt",
+                    on_event=lambda _name, _payload: None,
+                )
+
+        message = str(raised.exception)
+        self.assertIn("HTTP 403", message)
+        self.assertIn("POST /api/v1/ai/chat", message)
+        self.assertIn("response_body_bytes=0", message)
+        self.assertIn("request_id=request-123", message)
+        self.assertNotIn("private prompt", message)
+        self.assertNotIn("test-key", message)
+
     def test_chat_uses_bearer_auth_and_returns_conversation(self) -> None:
         response = _Response(
             {

@@ -999,6 +999,13 @@ class AppStartupTests(unittest.TestCase):
                     self.assertNotIn("git status --short --branch", api_prompt)
                     self.assertNotIn("deepbrid_tool", transcript)
                     self.assertTrue(app.chat_tool_mode)
+                    diagnostics = "\n".join(app.console_history)
+                    self.assertIn("POST /api/v1/ai/chat", diagnostics)
+                    self.assertIn("safe_commands_setting=on", diagnostics)
+                    self.assertIn("terminal_protocol=included", diagnostics)
+                    self.assertIn("whitelist_entries=1", diagnostics)
+                    self.assertIn("base_prompt_chars=", diagnostics)
+                    self.assertNotIn("List the project files.", diagnostics)
             finally:
                 root.destroy()
 

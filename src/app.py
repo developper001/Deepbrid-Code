@@ -2014,6 +2014,15 @@ class DeepbridCodeApp:
             f"assistant {selected_assistant or 'default'}, Web {'on' if web_enabled else 'off'}, "
             f"safe terminal tools {'on' if self.chat_tool_mode else 'off'}."
         )
+        self._log(
+            "Chat API request diagnostics: POST /api/v1/ai/chat; stream=true; "
+            f"conversation={'existing' if self.api_conversation_id else 'new'}; "
+            f"safe_commands_setting={'on' if self.allow_terminal_tools else 'off'}; "
+            f"terminal_protocol={'included' if self.chat_tool_mode else 'omitted'}; "
+            f"whitelist_entries={len(self.active_terminal_command_whitelist)}; "
+            f"base_prompt_chars={len(prompt)}; api_prompt_chars={len(api_prompt)}; "
+            f"api_prompt_bytes={len(api_prompt.encode('utf-8'))}."
+        )
         self._append_chat("You", prompt)
         if attachment_paths:
             self._append_chat(

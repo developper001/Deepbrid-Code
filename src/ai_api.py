@@ -453,7 +453,7 @@ class DeepbridApiClient:
                             content_parts.append(text)
 
         except urllib.error.HTTPError as error:
-            self._raise_http_error(error)
+            self._raise_http_error(error, method="POST")
         except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
             raise DeepbridApiError(
                 f"Could not reach the Deepbrid AI API: {error}"
@@ -549,7 +549,7 @@ class DeepbridApiClient:
                         )
                     chunks.append(chunk)
         except urllib.error.HTTPError as error:
-            self._raise_http_error(error)
+            self._raise_http_error(error, method="GET")
         except (urllib.error.URLError, TimeoutError) as error:
             raise DeepbridApiError(
                 f"Could not download the Deepbrid media: {error}"
@@ -577,7 +577,7 @@ class DeepbridApiClient:
             temporary_path.replace(destination)
             temporary_path = None
         except urllib.error.HTTPError as error:
-            self._raise_http_error(error)
+            self._raise_http_error(error, method="GET")
         except (urllib.error.URLError, TimeoutError) as error:
             raise DeepbridApiError(
                 f"Could not download the Deepbrid media: {error}"
@@ -678,10 +678,41 @@ class DeepbridApiClient:
             "User-Agent": "DeepbridCode/1.0",
         }
 
-    def _raise_http_error(self, error: urllib.error.HTTPError) -> NoReturn:
+    def _raise_http_error(
+        self,
+        error: urllib.error.HTTPError,
+        *,
+        method: str,
+    ) -> NoReturn:
         status = error.code
-        payload = error.read().decode("utf-8", errors="replace")
+        response_body = error.read()
+        payload = response_body.decode("utf-8", errors="replace")
         error.close()
+        error_url = getattr(error, "url", None) or getattr(error, "filename", "")
+        endpoint = urllib.parse.urlsplit(str(error_url)).path or "unknown"
+        response_headers = getattr(error, "headers", None) or getattr(
+            error,
+            "hdrs",
+            None,
+        )
+        content_type = (
+            response_headers.get("Content-Type", "unknown")
+            if response_headers
+            else "unknown"
+        )
+        request_id = next(
+            (
+                response_headers.get(header)
+                for header in ("X-Request-ID", "Request-ID", "X-Correlation-ID", "CF-Ray")
+                if response_headers and response_headers.get(header)
+            ),
+            None,
+        )
+        content_type = " ".join(str(content_type).split())[:128]
+        if request_id:
+            request_id = " ".join(str(request_id).split())[:128]
+            if self.api_key:
+                request_id = request_id.replace(self.api_key, "<redacted>")
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
@@ -694,8 +725,14 @@ class DeepbridApiClient:
         )
         if code is not None:
             code = str(code).replace(self.api_key, "<redacted>")
+        diagnostic = (
+            f"{method} {endpoint}; response_content_type={content_type}; "
+            f"response_body_bytes={len(response_body)}"
+        )
+        if request_id:
+            diagnostic += f"; request_id={request_id}"
         raise DeepbridApiError(
-            f"Deepbrid AI API returned HTTP {status}"
+            f"Deepbrid AI API returned HTTP {status} for {diagnostic}"
             f"{f' ({code})' if code else ''}: {detail or 'No response details'}"
         ) from error
 
@@ -758,7 +795,7 @@ class DeepbridApiClient:
                 status = response.status
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
-            self._raise_http_error(error)
+            self._raise_http_error(error, method=method)
         except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
             raise DeepbridApiError(f"Could not reach the Deepbrid AI API: {error}") from error
 
