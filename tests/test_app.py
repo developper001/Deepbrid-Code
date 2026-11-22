@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import tempfile
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +93,15 @@ class AppStartupTests(unittest.TestCase):
                     )
                     self.assertEqual(app.assistant_selector.get(), "Default")
                     self.assertFalse(app.web_enabled)
+                    style = ttk.Style(root)
+                    self.assertEqual(
+                        style.lookup("TCombobox", "foreground", ("readonly",)),
+                        "#e8eee9",
+                    )
+                    self.assertEqual(
+                        style.lookup("TCombobox", "fieldbackground", ("readonly",)),
+                        "#171c19",
+                    )
                     self.assertEqual(
                         app.output_log_path,
                         str(Path(__file__).resolve().parents[1] / "diagnostics" / "deepbrid-code.log"),

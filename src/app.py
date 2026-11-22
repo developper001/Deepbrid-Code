@@ -1098,6 +1098,36 @@ class DeepbridCodeApp:
             fieldbackground=[("readonly", colors["field"])],
             foreground=[("readonly", colors["foreground"])],
         )
+        style.configure(
+            "TCombobox",
+            fieldbackground=colors["field"],
+            background=colors["surface"],
+            foreground=colors["foreground"],
+            arrowcolor=colors["foreground"],
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[
+                ("readonly", colors["field"]),
+                ("disabled", colors["surface"]),
+            ],
+            foreground=[
+                ("readonly", colors["foreground"]),
+                ("disabled", colors["disabled_foreground"]),
+            ],
+            background=[("active", colors["accent"])],
+            arrowcolor=[("disabled", colors["disabled_foreground"])],
+        )
+        self.root.option_add("*TCombobox*Listbox*Background", colors["field"])
+        self.root.option_add("*TCombobox*Listbox*Foreground", colors["foreground"])
+        self.root.option_add(
+            "*TCombobox*Listbox*selectBackground",
+            colors["selection"],
+        )
+        self.root.option_add(
+            "*TCombobox*Listbox*selectForeground",
+            colors["foreground"],
+        )
         style.map(
             "TButton",
             background=[("active", colors["accent"]), ("disabled", colors["surface"])],
